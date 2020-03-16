@@ -4,7 +4,7 @@ import mymodule
 # 1강. Dataframe & Series
 
 # dataframe은 pandas의 class입니다.
-# dataframe은 defuault는 csv파일에서 읽어옵니다.
+# dataframe은 default는 csv파일에서 읽어옵니다.
 dataframe = pandas.read_csv("temp.csv")
 mymodule.printline(dataframe)
 
