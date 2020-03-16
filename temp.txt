@@ -1,0 +1,3 @@
+John.25.student
+Bob.30.teacher
+Girl.27.streamer
