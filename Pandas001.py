@@ -26,3 +26,7 @@ mymodule.printline(s2)
 # dataframe은 series를 dictionary로 묶어서 만듭니다.
 dataframe = pandas.DataFrame(data=dict(num = s1, word = s2))
 mymodule.printline(dataframe)
+
+# 각 column을 선택하는 두 가지 방법
+print(dataframe.word)
+print(dataframe['num'])

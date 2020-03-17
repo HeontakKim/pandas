@@ -48,22 +48,22 @@ dataframe = pandas.DataFrame.from_records(friend_list)
 print(" 다른 DataFrame")
 mymodule.printline(dataframe)
 
-# 4) column index에 따라 select하기
+# 4) column index에 따라 column select하기
 # [row, column]
 sub_df = dataframe.iloc[:,:2]
-print(" 4) column index에 따라 select하기")
+print(" 4) column index에 따라 column select하기")
 mymodule.printline(sub_df)
 
-# 5) column index에 따라 select하기(불연속적 select)
+# 5) column index에 따라 column select하기(불연속적 select)
 sub_df = dataframe.iloc[:, [0,2]]
-print(" 5) column index에 따라 select하기(불연속적 select)")
+print(" 5) column index에 따라 column select하기(불연속적 select)")
 mymodule.printline(sub_df)
 
-# 6) column name으로 select하기
+# 6) column name으로 column select하기
 dataframe.columns = ["name", "age", "language"]
 
 sub_df = dataframe[["language", "age"]]
-print(" 6) column name으로 select하기")
+print(" 6) column name으로 column select하기")
 mymodule.printline(sub_df)
 
 # 6-2) filter 함수로 똑같은 짓 하기
