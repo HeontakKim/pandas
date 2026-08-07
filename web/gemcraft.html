@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>젬 가공 계산기 — 로스트아크 아크 그리드</title>
+<style>
+  :root {
+    --bg: #14161c; --panel: #1c1f28; --panel-2: #232733; --line: #2f3444;
+    --text: #e7e9ef; --dim: #949cb0; --accent: #7aa2f7; --good: #7fd88f;
+    --warn: #e6b455; --bad: #e5787d; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR",
+          "Malgun Gothic", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+  }
+  .panel h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 12px; font-weight: 600;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .row:last-child { margin-bottom: 0; }
+  label.lbl { min-width: 84px; color: var(--dim); font-size: 13px; }
+  button, select, input {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .seg button { border-radius: 0; margin: 0; border-right-width: 0; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; border-right-width: 1px; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #10131a; border-color: var(--accent); font-weight: 600; }
+  .primary { background: var(--accent); color: #10131a; font-weight: 600; border-color: var(--accent); }
+  input[type=number] { width: 76px; }
+  select { max-width: 100%; }
+  .hint { color: var(--dim); font-size: 12.5px; margin-top: 6px; }
+
+  .state-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+  .cell { background: var(--panel-2); border-radius: 8px; padding: 9px 11px; }
+  .cell .k { color: var(--dim); font-size: 11.5px; }
+  .cell .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .headline {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; margin-bottom: 12px; flex-wrap: wrap;
+  }
+  .headline .big { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--good); }
+  .headline .what { color: var(--dim); font-size: 13px; }
+
+  ol.opts { list-style: none; margin: 0; padding: 0; }
+  ol.opts li { margin-bottom: 5px; }
+  .opt {
+    display: grid; grid-template-columns: 30px 1fr auto auto; gap: 10px;
+    align-items: center; width: 100%; text-align: left; padding: 9px 12px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .opt .rank { color: var(--dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .opt .appear { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .opt .val { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 74px; text-align: right; }
+  .opt.top { border-color: var(--good); }
+  .opt.top .val { color: var(--good); }
+  .divider {
+    display: flex; align-items: center; gap: 10px; color: var(--warn);
+    font-size: 12.5px; margin: 10px 0;
+  }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--warn); opacity: 0.4; }
+
+  .bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; transition: width 0.1s linear; }
+  .ask { background: var(--panel-2); border: 1px solid var(--warn); border-radius: 8px; padding: 12px; }
+  .done { text-align: center; padding: 8px 0; }
+  .done .g { font-size: 30px; font-weight: 700; }
+  .g-전설 { color: var(--dim); } .g-유물 { color: var(--accent); } .g-고대 { color: var(--warn); }
+  .hide { display: none !important; }
+  footer { color: var(--dim); font-size: 12.5px; margin-top: 26px; }
+  footer a { color: var(--accent); }
+  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>젬 가공 계산기</h1>
+  <div class="sub">로스트아크 아크 그리드 · 매 턴 뜬 4개 중 무엇을 골라야 하는지 계산합니다</div>
+
+  <div class="panel" id="setup">
+    <h2>설정</h2>
+    <div class="row">
+      <label class="lbl">젬 등급</label>
+      <span class="seg" id="grade"></span>
+    </div>
+    <div class="row">
+      <label class="lbl">목표</label>
+      <select id="goal">
+        <option value="ancient">고대 젬 — 레벨 총합 19 이상</option>
+        <option value="relic">유물 이상 — 레벨 총합 16 이상</option>
+        <option value="target=4,4,0,0">의지력·포인트 4 이상</option>
+        <option value="target=5,5,0,0">의지력·포인트 5 (만렙)</option>
+        <option value="total">레벨 총합 최대화</option>
+        <option value="custom">직접 지정…</option>
+      </select>
+    </div>
+    <div class="row hide" id="customGoal">
+      <label class="lbl">최소 레벨</label>
+      <span>의지력</span><select class="minlv" id="min0"></select>
+      <span>포인트</span><select class="minlv" id="min1"></select>
+      <span>효과1</span><select class="minlv" id="min2"></select>
+      <span>효과2</span><select class="minlv" id="min3"></select>
+      <span>총합</span><input type="number" id="minTotal" min="4" max="20" placeholder="무시">
+    </div>
+    <div class="row">
+      <label class="lbl">효과 종류</label>
+      <label><input type="checkbox" id="useEffects"> 원하는 효과인지 따진다</label>
+      <span id="pGoodWrap" class="hide">
+        변경 시 원하는 효과가 나올 확률
+        <input type="number" id="pGood" min="0" max="1" step="0.005" value="0.375">
+      </span>
+    </div>
+    <div class="row">
+      <button class="primary" id="start">계산 시작</button>
+      <button id="manual">현재 진행 중인 젬 입력…</button>
+    </div>
+    <div class="row hide" id="manualBox">
+      <label class="lbl">현재 레벨</label>
+      <span>의지력</span><select class="curlv" id="cur0"></select>
+      <span>포인트</span><select class="curlv" id="cur1"></select>
+      <span>효과1</span><select class="curlv" id="cur2"></select>
+      <span>효과2</span><select class="curlv" id="cur3"></select>
+      <span>남은 시도</span><input type="number" id="curAttempts" min="1">
+      <span>남은 리롤</span><input type="number" id="curRerolls" min="0">
+    </div>
+    <div class="hint" id="setupHint"></div>
+    <div class="bar hide" id="progress"><div></div></div>
+  </div>
+
+  <div class="panel hide" id="session">
+    <div class="headline">
+      <div><span class="big" id="value">—</span> <span class="what" id="valueWhat"></span></div>
+      <div>
+        <button id="undo">되돌리기</button>
+        <button id="restart">처음부터</button>
+      </div>
+    </div>
+    <div class="state-grid" id="stateGrid"></div>
+  </div>
+
+  <div class="panel hide" id="choices">
+    <h2>선택지 순위 — 뜬 4개 중 가장 위에 있는 것을 고르세요</h2>
+    <div id="askBox" class="ask hide"></div>
+    <ol class="opts" id="optList"></ol>
+    <div id="rerollBox"></div>
+  </div>
+
+  <div class="panel hide" id="finished"></div>
+
+  <footer>
+    확률·횟수는 로스트아크
+    <a href="https://m-lostark.game.onstove.com/Probability/%EC%A0%AC%20%EA%B0%80%EA%B3%B5,%20%EC%A0%AC%20%EC%9C%B5%ED%95%A9" target="_blank" rel="noopener">공식 확률 공개</a>와
+    <a href="https://m-lostark.game.onstove.com/GameGuide/Pages/%EC%95%84%ED%81%AC%20%EA%B7%B8%EB%A6%AC%EB%93%9C" target="_blank" rel="noopener">공식 게임 가이드</a>에서 가져왔습니다 (확률 합계 100.0000%).
+    4개 선택지는 각 자리가 독립적으로 뽑힌다고 가정합니다.
+    계산은 전부 브라우저 안에서 이뤄지며 서버로 아무것도 보내지 않습니다.
+  </footer>
+</div>
+
+<script>
+// ==GEMCRAFT-ENGINE-START==
+// 이 블록은 Python 패키지 gemcraft 의 rules.py / state.py / objectives.py /
+// solver.py 를 그대로 옮긴 것이다. tests/test_web_parity.py 가 node 로 이
+// 블록을 실행해 Python 이 계산한 값과 1e-9 이내로 일치하는지 검사한다.
+// 규칙을 고칠 때는 반드시 Python 쪽과 함께 고쳐야 한다.
+
+const WILL = 0, POINT = 1, EFF1 = 2, EFF2 = 3;
+
+const RULES = {
+  handSize: 4,
+  minLevel: 1,
+  maxLevel: 5,
+  costMin: -1,
+  costMax: 1,
+  baseCostGold: 900,
+  rerollAvailableFromTurn: 1,
+  attrNames: ["의지력 효율", "질서/혼돈 포인트", "첫번째 효과", "두번째 효과"],
+  // 등급: [가공 시도 횟수, 다른 항목 보기 기본 횟수]
+  grades: { "고급": [5, 0], "희귀": [7, 1], "영웅": [9, 2] },
+  gradeThresholds: [["전설", 4], ["유물", 16], ["고대", 19]],
+  // [id, 표시명, 등장 확률(%), 종류, 파라미터]
+  options: [
+    ["will+1", "의지력 효율 +1 증가", 11.65, "delta", [WILL, 1]],
+    ["will+2", "의지력 효율 +2 증가", 4.40, "delta", [WILL, 2]],
+    ["will+3", "의지력 효율 +3 증가", 1.75, "delta", [WILL, 3]],
+    ["will+4", "의지력 효율 +4 증가", 0.45, "delta", [WILL, 4]],
+    ["will-1", "의지력 효율 -1 감소", 3.00, "delta", [WILL, -1]],
+    ["point+1", "질서/혼돈 포인트 +1 증가", 11.65, "delta", [POINT, 1]],
+    ["point+2", "질서/혼돈 포인트 +2 증가", 4.40, "delta", [POINT, 2]],
+    ["point+3", "질서/혼돈 포인트 +3 증가", 1.75, "delta", [POINT, 3]],
+    ["point+4", "질서/혼돈 포인트 +4 증가", 0.45, "delta", [POINT, 4]],
+    ["point-1", "질서/혼돈 포인트 -1 감소", 3.00, "delta", [POINT, -1]],
+    ["eff1+1", "첫번째 효과 Lv. 1 증가", 11.65, "delta", [EFF1, 1]],
+    ["eff1+2", "첫번째 효과 Lv. 2 증가", 4.40, "delta", [EFF1, 2]],
+    ["eff1+3", "첫번째 효과 Lv. 3 증가", 1.75, "delta", [EFF1, 3]],
+    ["eff1+4", "첫번째 효과 Lv. 4 증가", 0.45, "delta", [EFF1, 4]],
+    ["eff1-1", "첫번째 효과 Lv. 1 감소", 3.00, "delta", [EFF1, -1]],
+    ["eff2+1", "두번째 효과 Lv. 1 증가", 11.65, "delta", [EFF2, 1]],
+    ["eff2+2", "두번째 효과 Lv. 2 증가", 4.40, "delta", [EFF2, 2]],
+    ["eff2+3", "두번째 효과 Lv. 3 증가", 1.75, "delta", [EFF2, 3]],
+    ["eff2+4", "두번째 효과 Lv. 4 증가", 0.45, "delta", [EFF2, 4]],
+    ["eff2-1", "두번째 효과 Lv. 1 감소", 3.00, "delta", [EFF2, -1]],
+    ["chg1", "첫번째 효과 변경", 3.25, "change", EFF1],
+    ["chg2", "두번째 효과 변경", 3.25, "change", EFF2],
+    ["cost+", "가공 비용 +100% 증가", 1.75, "cost", 1],
+    ["cost-", "가공 비용 -100% 감소", 1.75, "cost", -1],
+    ["keep", "가공 상태 유지", 1.75, "keep", null],
+    ["reroll+1", "다른 항목 보기 +1회 증가", 2.50, "reroll", 1],
+    ["reroll+2", "다른 항목 보기 +2회 증가", 0.75, "reroll", 2],
+  ],
+};
+
+const N_OPT = RULES.options.length;
+const LEVELS = RULES.maxLevel - RULES.minLevel + 1;
+const N_COST = RULES.costMax - RULES.costMin + 1;
+const N_ATTR = LEVELS ** 4 * 2 * 2 * N_COST;
+const OPTION_INDEX = {};
+RULES.options.forEach((o, i) => { OPTION_INDEX[o[0]] = i; });
+
+function gemGrade(total) {
+  let name = RULES.gradeThresholds[0][0];
+  for (const [label, threshold] of RULES.gradeThresholds) if (total >= threshold) name = label;
+  return name;
+}
+
+function encode(will, point, e1, e2, g1, g2, cost) {
+  const lvl = (((will - 1) * LEVELS + (point - 1)) * LEVELS + (e1 - 1)) * LEVELS + (e2 - 1);
+  return ((lvl * 2 + (g1 ? 1 : 0)) * 2 + (g2 ? 1 : 0)) * N_COST + (cost - RULES.costMin);
+}
+
+function decode(index) {
+  const cost = index % N_COST; index = (index - cost) / N_COST;
+  const g2 = index % 2; index = (index - g2) / 2;
+  const g1 = index % 2; let lvl = (index - g1) / 2;
+  const e2 = lvl % LEVELS; lvl = (lvl - e2) / LEVELS;
+  const e1 = lvl % LEVELS; lvl = (lvl - e1) / LEVELS;
+  const point = lvl % LEVELS; const will = (lvl - point) / LEVELS;
+  return { will: will + 1, point: point + 1, eff1: e1 + 1, eff2: e2 + 1,
+           eff1Good: !!g1, eff2Good: !!g2, cost: cost + RULES.costMin };
+}
+
+// --- 상태 테이블 (모든 정책이 공유하므로 한 번만 만든다) -------------------------
+const TABLES = (() => {
+  const level = [];
+  for (let a = 0; a < 4; a++) level.push(new Int8Array(N_ATTR));
+  const good = [new Uint8Array(N_ATTR), new Uint8Array(N_ATTR)];
+  const cost = new Int8Array(N_ATTR);
+  for (let s = 0; s < N_ATTR; s++) {
+    const d = decode(s);
+    level[WILL][s] = d.will; level[POINT][s] = d.point;
+    level[EFF1][s] = d.eff1; level[EFF2][s] = d.eff2;
+    good[0][s] = d.eff1Good ? 1 : 0; good[1][s] = d.eff2Good ? 1 : 0;
+    cost[s] = d.cost;
+  }
+
+  // 공식 확률표의 '미등장 조건'
+  const valid = new Uint8Array(N_ATTR * N_OPT).fill(1);
+  for (let o = 0; o < N_OPT; o++) {
+    const [, , , kind, param] = RULES.options[o];
+    for (let s = 0; s < N_ATTR; s++) {
+      let ok = true;
+      if (kind === "delta") {
+        const [attr, delta] = param;
+        const lv = level[attr][s];
+        ok = delta > 0 ? lv <= RULES.maxLevel - delta : lv > RULES.minLevel;
+      } else if (kind === "cost") {
+        ok = cost[s] !== (param > 0 ? RULES.costMax : RULES.costMin);
+      }
+      if (!ok) valid[s * N_OPT + o] = 0;
+    }
+  }
+
+  // 미등장 선택지를 뺀 뒤 재정규화한 등장 확률
+  const prob = new Float64Array(N_ATTR * N_OPT);
+  const validStart = new Int32Array(N_ATTR + 1);
+  const validBuf = [];
+  for (let s = 0; s < N_ATTR; s++) {
+    validStart[s] = validBuf.length;
+    let total = 0;
+    for (let o = 0; o < N_OPT; o++) if (valid[s * N_OPT + o]) total += RULES.options[o][2];
+    for (let o = 0; o < N_OPT; o++) {
+      if (!valid[s * N_OPT + o]) continue;
+      prob[s * N_OPT + o] = RULES.options[o][2] / total;
+      validBuf.push(o);
+    }
+  }
+  validStart[N_ATTR] = validBuf.length;
+
+  const gained = new Int32Array(N_OPT);
+  for (let o = 0; o < N_OPT; o++) {
+    const [, , , kind, param] = RULES.options[o];
+    if (kind === "reroll") gained[o] = param;
+  }
+
+  return { level, good, cost, valid, prob, gained,
+           validStart, validList: Int32Array.from(validBuf) };
+})();
+
+/** 선택지를 골랐을 때의 다음 속성 상태. 효과 변경만 확률적이다. */
+function buildTransitions(pGood) {
+  const { level, good, cost } = TABLES;
+  const succA = new Int32Array(N_ATTR * N_OPT);
+  const succB = new Int32Array(N_ATTR * N_OPT);
+  const mixA = new Float64Array(N_ATTR * N_OPT).fill(1);
+  for (let s = 0; s < N_ATTR; s++) {
+    const lv = [level[0][s], level[1][s], level[2][s], level[3][s]];
+    const g = [good[0][s], good[1][s]];
+    const c = cost[s];
+    for (let o = 0; o < N_OPT; o++) {
+      const [, , , kind, param] = RULES.options[o];
+      const at = s * N_OPT + o;
+      if (kind === "delta") {
+        const [attr, delta] = param;
+        const next = lv.slice();
+        next[attr] = Math.min(RULES.maxLevel, Math.max(RULES.minLevel, next[attr] + delta));
+        succA[at] = succB[at] = encode(next[0], next[1], next[2], next[3], g[0], g[1], c);
+      } else if (kind === "change") {
+        const slot = param === EFF1 ? 0 : 1;
+        const gg = g.slice(); gg[slot] = 1;
+        const gb = g.slice(); gb[slot] = 0;
+        succA[at] = encode(lv[0], lv[1], lv[2], lv[3], gg[0], gg[1], c);
+        succB[at] = encode(lv[0], lv[1], lv[2], lv[3], gb[0], gb[1], c);
+        mixA[at] = pGood;
+      } else if (kind === "cost") {
+        const nc = Math.min(RULES.costMax, Math.max(RULES.costMin, c + param));
+        succA[at] = succB[at] = encode(lv[0], lv[1], lv[2], lv[3], g[0], g[1], nc);
+      } else {
+        succA[at] = succB[at] = s;
+      }
+    }
+  }
+  return { succA, succB, mixA };
+}
+
+// --- 목표 --------------------------------------------------------------------
+function parseGoal(spec, badEffectScale = 0) {
+  const { level, good } = TABLES;
+  const total = (s) => level[0][s] + level[1][s] + level[2][s] + level[3][s];
+  const make = (name, description, fn, isProbability) => ({
+    name, description, isProbability,
+    terminalValues() {
+      const v = new Float64Array(N_ATTR);
+      for (let s = 0; s < N_ATTR; s++) v[s] = fn(s);
+      return v;
+    },
+  });
+
+  spec = String(spec).trim();
+  const gradeMin = Object.fromEntries(RULES.gradeThresholds);
+  if (spec === "ancient") return make(spec, "고대 젬(총합 19+) 확률", (s) => total(s) >= gradeMin["고대"] ? 1 : 0, true);
+  if (spec === "relic") return make(spec, "유물 이상(총합 16+) 확률", (s) => total(s) >= gradeMin["유물"] ? 1 : 0, true);
+  if (spec === "total") return make(spec, "레벨 총합 기댓값", total, false);
+
+  let m = spec.match(/^target=(\d),(\d),(\d),(\d)((?:\+good|\+total\d+)*)$/);
+  if (m) {
+    const mins = [1, 2, 3, 4].map((i) => parseInt(m[i], 10));
+    const flags = m[5] || "";
+    const requireGood = flags.includes("+good");
+    const totalMatch = flags.match(/\+total(\d+)/);
+    const minTotal = totalMatch ? parseInt(totalMatch[1], 10) : null;
+    for (const need of mins) {
+      if (need && (need < RULES.minLevel || need > RULES.maxLevel)) {
+        throw new Error(`목표 레벨이 범위를 벗어났습니다: ${need}`);
+      }
+    }
+    const parts = [];
+    mins.forEach((n, a) => { if (n > RULES.minLevel) parts.push(`${RULES.attrNames[a]}≥${n}`); });
+    if (minTotal !== null) parts.push(`총합≥${minTotal}`);
+    if (requireGood) parts.push("효과 종류 일치");
+    const fn = (s) => {
+      for (let a = 0; a < 4; a++) if (mins[a] > RULES.minLevel && level[a][s] < mins[a]) return 0;
+      if (minTotal !== null && total(s) < minTotal) return 0;
+      if (requireGood) {
+        if (mins[EFF1] > RULES.minLevel && !good[0][s]) return 0;
+        if (mins[EFF2] > RULES.minLevel && !good[1][s]) return 0;
+      }
+      return 1;
+    };
+    return make(spec, `${parts.join(" · ") || "조건 없음"} 달성 확률`, fn, true);
+  }
+
+  m = spec.match(/^weighted=([\d.]+),([\d.]+),([\d.]+),([\d.]+)$/);
+  if (m) {
+    const w = [1, 2, 3, 4].map((i) => parseFloat(m[i]));
+    const desc = "가중 점수 기댓값 (" +
+      w.map((x, a) => `${RULES.attrNames[a]}×${x}`).join(", ") + ")";
+    const fn = (s) => {
+      let out = w[WILL] * level[WILL][s] + w[POINT] * level[POINT][s];
+      out += w[EFF1] * level[EFF1][s] * (good[0][s] ? 1 : badEffectScale);
+      out += w[EFF2] * level[EFF2][s] * (good[1][s] ? 1 : badEffectScale);
+      return out;
+    };
+    return make(spec, desc, fn, false);
+  }
+  throw new Error(`알 수 없는 목표: ${spec}`);
+}
+
+// --- 정책 (DP) ----------------------------------------------------------------
+class Policy {
+  constructor(grade, objective, pGood = 1, attempts = null) {
+    if (!(grade in RULES.grades)) throw new Error(`알 수 없는 젬 등급: ${grade}`);
+    this.grade = grade;
+    this.objective = objective;
+    this.pGood = pGood;
+    const [defaultAttempts, baseRerolls] = RULES.grades[grade];
+    this.attempts = attempts === null ? defaultAttempts : attempts;
+    this.baseRerolls = baseRerolls;
+    this.maxRerolls = baseRerolls + 2 * this.attempts;
+    this.rStride = this.maxRerolls + 1;
+    Object.assign(this, buildTransitions(pGood));
+    this.values = new Float64Array((this.attempts + 1) * this.rStride * N_ATTR);
+    this._solved = false;
+  }
+
+  _layer(n, r) { return (n * this.rStride + r) * N_ATTR; }
+
+  /** 레이어 하나씩 계산하는 제너레이터. UI 가 진행률을 표시하며 돌릴 수 있다. */
+  *solveSteps() {
+    const terminal = this.objective.terminalValues();
+    for (let r = 0; r <= this.maxRerolls; r++) this.values.set(terminal, this._layer(0, r));
+
+    const { prob, gained, validStart, validList } = TABLES;
+    const { succA, succB, mixA, values } = this;
+    const H = RULES.handSize;
+    const q = new Float64Array(N_OPT);
+    const order = new Int32Array(N_OPT);
+    const prevOff = new Int32Array(N_OPT);
+    const totalLayers = this.attempts * this.rStride;
+    let doneLayers = 0;
+
+    for (let n = 1; n <= this.attempts; n++) {
+      const canReroll = this.attempts - n >= RULES.rerollAvailableFromTurn;
+      for (let r = 0; r <= this.maxRerolls; r++) {
+        for (let o = 0; o < N_OPT; o++) {
+          prevOff[o] = this._layer(n - 1, Math.min(r + gained[o], this.maxRerolls));
+        }
+        const out = this._layer(n, r);
+        const floorOff = canReroll && r >= 1 ? this._layer(n, r - 1) : -1;
+
+        for (let s = 0; s < N_ATTR; s++) {
+          const base = s * N_OPT;
+          const lo = validStart[s], hi = validStart[s + 1];
+          const m = hi - lo;
+          for (let i = 0; i < m; i++) {
+            const o = validList[lo + i];
+            const at = base + o;
+            const mix = mixA[at];
+            q[o] = mix === 1
+              ? values[prevOff[o] + succA[at]]
+              : mix * values[prevOff[o] + succA[at]] + (1 - mix) * values[prevOff[o] + succB[at]];
+            order[i] = o;
+          }
+          // 가치 내림차순 정렬 (원소가 20여 개라 삽입 정렬이 가장 빠르다)
+          for (let i = 1; i < m; i++) {
+            const oi = order[i], qi = q[oi];
+            let j = i - 1;
+            while (j >= 0 && q[order[j]] < qi) { order[j + 1] = order[j]; j--; }
+            order[j + 1] = oi;
+          }
+          const floor = floorOff >= 0 ? values[floorOff + s] : -Infinity;
+          let acc = 0, expected = 0;
+          for (let i = 0; i < m; i++) {
+            const o = order[i];
+            const before = 1 - acc;
+            acc += prob[base + o];
+            const after = 1 - acc;
+            let w = before * before * before * before - after * after * after * after;
+            if (w <= 0) continue;
+            const value = q[o] > floor ? q[o] : floor;
+            expected += value * w;
+          }
+          values[out + s] = expected;
+        }
+        doneLayers++;
+        yield doneLayers / totalLayers;
+      }
+    }
+    this._solved = true;
+  }
+
+  solve() { for (const _ of this.solveSteps()) { /* 동기 실행 */ } return this; }
+
+  _check(gem) {
+    if (gem.attemptsLeft < 0 || gem.attemptsLeft > this.attempts) {
+      throw new Error(`남은 가공 시도 횟수가 범위를 벗어났습니다: ${gem.attemptsLeft}`);
+    }
+    if (gem.rerollsLeft < 0 || gem.rerollsLeft > this.maxRerolls) {
+      throw new Error(`다른 항목 보기 횟수가 범위를 벗어났습니다: ${gem.rerollsLeft}`);
+    }
+  }
+
+  index(gem) {
+    return encode(gem.will, gem.point, gem.eff1, gem.eff2,
+                  gem.eff1Good, gem.eff2Good, gem.cost);
+  }
+
+  /** 이 상태에서 최적으로 진행했을 때의 목표 기댓값. */
+  stateValue(gem) {
+    this._check(gem);
+    return this.values[this._layer(gem.attemptsLeft, gem.rerollsLeft) + this.index(gem)];
+  }
+
+  _qRow(idx, n, r) {
+    const out = new Float64Array(N_OPT);
+    const { gained } = TABLES;
+    for (let o = 0; o < N_OPT; o++) {
+      const at = idx * N_OPT + o;
+      const off = this._layer(n - 1, Math.min(r + gained[o], this.maxRerolls));
+      const mix = this.mixA[at];
+      out[o] = mix * this.values[off + this.succA[at]]
+             + (1 - mix) * this.values[off + this.succB[at]];
+    }
+    return out;
+  }
+
+  /** 모든 선택지를 가치 내림차순으로. 뜬 4개 중 가장 위의 것이 최적. */
+  optionValues(gem) {
+    this._check(gem);
+    if (gem.attemptsLeft === 0) throw new Error("남은 가공 시도 횟수가 0 입니다.");
+    const idx = this.index(gem);
+    const q = this._qRow(idx, gem.attemptsLeft, gem.rerollsLeft);
+    const rows = RULES.options.map(([id, label], o) => ({
+      id, label, value: q[o],
+      available: !!TABLES.valid[idx * N_OPT + o],
+      appearProb: TABLES.prob[idx * N_OPT + o],
+    }));
+    rows.sort((a, b) => (a.available !== b.available)
+      ? (a.available ? -1 : 1) : b.value - a.value);
+    return rows;
+  }
+
+  /** 리롤을 눌렀을 때의 가치. 쓸 수 없으면 null. */
+  rerollValue(gem) {
+    this._check(gem);
+    const turn = this.attempts - gem.attemptsLeft;
+    if (gem.rerollsLeft < 1 || turn < RULES.rerollAvailableFromTurn) return null;
+    return this.values[this._layer(gem.attemptsLeft, gem.rerollsLeft - 1) + this.index(gem)];
+  }
+}
+
+/** 선택지를 적용한 다음 상태. 효과 변경 결과(newGood)는 호출자가 알려 준다. */
+function applyOption(gem, optionId, newGood, maxRerolls) {
+  const [, , , kind, param] = RULES.options[OPTION_INDEX[optionId]];
+  const next = Object.assign({}, gem);
+  const keys = ["will", "point", "eff1", "eff2"];
+  if (kind === "delta") {
+    const [attr, delta] = param;
+    next[keys[attr]] = Math.min(RULES.maxLevel, Math.max(RULES.minLevel, next[keys[attr]] + delta));
+  } else if (kind === "change") {
+    next[param === EFF1 ? "eff1Good" : "eff2Good"] = !!newGood;
+  } else if (kind === "cost") {
+    next.cost = Math.min(RULES.costMax, Math.max(RULES.costMin, next.cost + param));
+  } else if (kind === "reroll") {
+    next.rerollsLeft = Math.min(maxRerolls, next.rerollsLeft + param);
+  }
+  next.attemptsLeft -= 1;
+  return next;
+}
+
+function initialState(grade) {
+  const [attempts, rerolls] = RULES.grades[grade];
+  return { will: 1, point: 1, eff1: 1, eff2: 1, eff1Good: true, eff2Good: true,
+           cost: 0, attemptsLeft: attempts, rerollsLeft: rerolls };
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { RULES, N_ATTR, N_OPT, encode, decode, gemGrade, parseGoal,
+                     Policy, applyOption, initialState, OPTION_INDEX };
+}
+// ==GEMCRAFT-ENGINE-END==
+</script>
+
+<script>
+// --- UI ----------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const state = { grade: "영웅", policy: null, gem: null, history: [], pending: null };
+
+// 설정 위젯 채우기
+$("grade").innerHTML = Object.keys(RULES.grades).map((g) => {
+  const [a, r] = RULES.grades[g];
+  return `<button data-grade="${g}" aria-pressed="${g === state.grade}">${g} <small>(${a}회·리롤${r})</small></button>`;
+}).join("");
+$("grade").onclick = (e) => {
+  const btn = e.target.closest("button[data-grade]");
+  if (!btn) return;
+  state.grade = btn.dataset.grade;
+  [...$("grade").children].forEach((b) => b.setAttribute("aria-pressed", b === btn));
+  syncManualDefaults();
+};
+for (const sel of document.querySelectorAll(".minlv")) {
+  sel.innerHTML = ["무시", 2, 3, 4, 5].map((v, i) =>
+    `<option value="${i === 0 ? 0 : v}">${v}</option>`).join("");
+}
+for (const sel of document.querySelectorAll(".curlv")) {
+  sel.innerHTML = [1, 2, 3, 4, 5].map((v) => `<option value="${v}">${v}</option>`).join("");
+}
+$("goal").onchange = () => $("customGoal").classList.toggle("hide", $("goal").value !== "custom");
+$("useEffects").onchange = () => $("pGoodWrap").classList.toggle("hide", !$("useEffects").checked);
+$("manual").onclick = () => { $("manualBox").classList.toggle("hide"); syncManualDefaults(); };
+
+function syncManualDefaults() {
+  const [attempts, rerolls] = RULES.grades[state.grade];
+  $("curAttempts").max = attempts;
+  if (!$("curAttempts").value) { $("curAttempts").value = attempts; $("curRerolls").value = rerolls; }
+}
+syncManualDefaults();
+
+function goalSpec() {
+  const chosen = $("goal").value;
+  if (chosen !== "custom") return chosen;
+  const mins = [0, 1, 2, 3].map((i) => parseInt($("min" + i).value, 10) || 0);
+  const totalValue = parseInt($("minTotal").value, 10);
+  let spec = `target=${mins.join(",")}`;
+  if ($("useEffects").checked && (mins[EFF1] || mins[EFF2])) spec += "+good";
+  if (Number.isFinite(totalValue)) spec += `+total${totalValue}`;
+  return spec;
+}
+
+function currentGem() {
+  const manual = !$("manualBox").classList.contains("hide");
+  const gem = initialState(state.grade);
+  if (!manual) return gem;
+  for (const [i, key] of ["will", "point", "eff1", "eff2"].entries()) {
+    gem[key] = parseInt($("cur" + i).value, 10);
+  }
+  gem.attemptsLeft = parseInt($("curAttempts").value, 10);
+  gem.rerollsLeft = parseInt($("curRerolls").value, 10);
+  return gem;
+}
+
+$("start").onclick = () => {
+  let objective, policy, gem;
+  try {
+    objective = parseGoal(goalSpec());
+    policy = new Policy(state.grade, objective,
+      $("useEffects").checked ? parseFloat($("pGood").value) : 1);
+    gem = currentGem();
+    policy._check(gem);
+  } catch (err) {
+    $("setupHint").textContent = "⚠ " + err.message;
+    return;
+  }
+  $("setupHint").textContent = "";
+  $("start").disabled = true;
+  $("progress").classList.remove("hide");
+
+  const steps = policy.solveSteps();
+  const pump = () => {
+    const t0 = performance.now();
+    let step;
+    while (!(step = steps.next()).done) {
+      if (performance.now() - t0 > 40) {
+        $("progress").firstElementChild.style.width = (step.value * 100).toFixed(1) + "%";
+        return setTimeout(pump, 0);
+      }
+    }
+    $("progress").classList.add("hide");
+    $("progress").firstElementChild.style.width = "0";
+    $("start").disabled = false;
+    state.policy = policy;
+    state.gem = gem;
+    state.history = [];
+    render();
+  };
+  setTimeout(pump, 0);
+};
+
+$("undo").onclick = () => {
+  if (!state.history.length) return;
+  state.gem = state.history.pop();
+  state.pending = null;
+  render();
+};
+$("restart").onclick = () => {
+  state.gem = currentGem();
+  state.history = [];
+  state.pending = null;
+  render();
+};
+
+const fmt = (v) => state.policy.objective.isProbability
+  ? (v * 100).toFixed(2) + "%" : v.toFixed(3);
+
+function render() {
+  const { policy, gem } = state;
+  $("session").classList.remove("hide");
+  $("undo").disabled = !state.history.length;
+  $("value").textContent = fmt(policy.stateValue(gem));
+  $("valueWhat").textContent = policy.objective.description;
+
+  const total = gem.will + gem.point + gem.eff1 + gem.eff2;
+  const cells = [
+    ["의지력 효율", gem.will], ["질서/혼돈 포인트", gem.point],
+    ["첫번째 효과", gem.eff1 + (gem.eff1Good ? "" : " ✗")],
+    ["두번째 효과", gem.eff2 + (gem.eff2Good ? "" : " ✗")],
+    ["레벨 총합", `${total} (${gemGrade(total)})`],
+    ["남은 시도", gem.attemptsLeft], ["남은 리롤", gem.rerollsLeft],
+  ];
+  if (gem.cost !== 0) cells.push(["가공 비용", (gem.cost > 0 ? "+" : "") + gem.cost * 100 + "%"]);
+  $("stateGrid").innerHTML = cells.map(([k, v]) =>
+    `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+
+  if (gem.attemptsLeft === 0) {
+    $("choices").classList.add("hide");
+    $("finished").classList.remove("hide");
+    $("finished").innerHTML =
+      `<div class="done"><div class="g g-${gemGrade(total)}">${gemGrade(total)} 젬</div>` +
+      `<div class="what">레벨 총합 ${total} · 목표 ${policy.objective.description}: ` +
+      `${fmt(policy.stateValue(gem))}</div></div>`;
+    return;
+  }
+  $("finished").classList.add("hide");
+  $("choices").classList.remove("hide");
+  renderChoices();
+}
+
+function renderChoices() {
+  const { policy, gem } = state;
+
+  if (state.pending) {
+    $("askBox").classList.remove("hide");
+    $("askBox").innerHTML =
+      `<b>${RULES.options[OPTION_INDEX[state.pending]][1]}</b> — 바뀐 효과가 원하는 효과인가요? ` +
+      `<button data-good="1">예</button> <button data-good="0">아니오</button> ` +
+      `<button data-good="cancel">취소</button>`;
+    $("askBox").onclick = (e) => {
+      const btn = e.target.closest("button[data-good]");
+      // 이미 답을 받은 뒤라면 무시한다 (숨겨진 상자의 잔여 클릭 방지).
+      if (!btn || !state.pending) return;
+      const answer = btn.dataset.good;
+      const optionId = state.pending;
+      state.pending = null;
+      if (answer === "cancel") return renderChoices();
+      commit(optionId, answer === "1");
+    };
+    $("optList").innerHTML = "";
+    $("rerollBox").innerHTML = "";
+    return;
+  }
+  $("askBox").classList.add("hide");
+  $("askBox").innerHTML = "";
+
+  const reroll = policy.rerollValue(gem);
+  const rows = policy.optionValues(gem).filter((row) => row.available);
+  let html = "";
+  let dividerDrawn = false;
+  rows.forEach((row, i) => {
+    if (reroll !== null && !dividerDrawn && row.value < reroll) {
+      html += `<div class="divider">여기부터는 리롤(${fmt(reroll)})이 더 낫습니다</div>`;
+      dividerDrawn = true;
+    }
+    html += `<li><button class="opt${i === 0 ? " top" : ""}" data-opt="${row.id}">` +
+      `<span class="rank">${i + 1}</span><span>${row.label}</span>` +
+      `<span class="appear">등장 ${(row.appearProb * 100).toFixed(2)}%</span>` +
+      `<span class="val">${fmt(row.value)}</span></button></li>`;
+  });
+  $("optList").innerHTML = html;
+  $("optList").onclick = (e) => {
+    const btn = e.target.closest("button[data-opt]");
+    if (!btn) return;
+    const optionId = btn.dataset.opt;
+    if (RULES.options[OPTION_INDEX[optionId]][3] === "change") {
+      state.pending = optionId;
+      return renderChoices();
+    }
+    commit(optionId, null);
+  };
+
+  if (reroll !== null) {
+    $("rerollBox").innerHTML =
+      `<div class="row" style="margin-top:12px"><button id="doReroll">다른 항목 보기 사용 ` +
+      `(남은 ${gem.rerollsLeft}회)</button><span class="hint">뜬 4개의 최고 순위가 위 ` +
+      `기준선보다 아래면 리롤하세요 — 가치 ${fmt(reroll)}</span></div>`;
+    $("doReroll").onclick = () => {
+      state.history.push(Object.assign({}, gem));
+      state.gem = Object.assign({}, gem, { rerollsLeft: gem.rerollsLeft - 1 });
+      render();
+    };
+  } else {
+    $("rerollBox").innerHTML = gem.rerollsLeft > 0
+      ? `<div class="hint">다른 항목 보기는 가공을 1회 진행한 뒤부터 쓸 수 있습니다.</div>` : "";
+  }
+}
+
+function commit(optionId, newGood) {
+  state.history.push(Object.assign({}, state.gem));
+  state.gem = applyOption(state.gem, optionId, newGood, state.policy.maxRerolls);
+  render();
+}
+</script>
+</body>
+</html>

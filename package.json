@@ -1,0 +1,12 @@
+{
+  "name": "gemcraft-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "브라우저용 젬 가공 계산기(web/gemcraft.html)의 테스트 전용 의존성",
+  "scripts": {
+    "test": "node tests/ui_driver.js web/gemcraft.html"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}

@@ -4,6 +4,38 @@
 목표 달성 확률이 가장 높은지 계산한다. 동적 계획법으로 모든 상태의 값 함수를
 정확히 풀어 두므로 결과는 근사치가 아니라 최적해다.
 
+두 가지로 쓸 수 있다.
+
+| | 필요한 것 | 용도 |
+|---|---|---|
+| **`web/gemcraft.html`** | 웹브라우저만 | 배포용. 설치·서버·인터넷 전부 불필요 |
+| **`python3 -m gemcraft.cli`** | Python + numpy | 개발·검증·시뮬레이션 |
+
+## 브라우저판 (설치 없이 쓰기)
+
+`web/gemcraft.html` **파일 하나만** 받아서 더블클릭하면 끝이다. 34KB짜리 단일
+HTML 이고 외부 리소스를 하나도 불러오지 않아서 인터넷 없이도 돌아가며, 계산은
+전부 브라우저 안에서 이뤄지고 서버로는 아무것도 나가지 않는다. 모바일 브라우저도 된다.
+
+친구들에게 뿌리는 방법은 둘 중 편한 쪽으로:
+
+- **파일 전달** — 카톡/디스코드로 `gemcraft.html` 을 그냥 보낸다. 받는 쪽은 열기만 하면 된다.
+- **링크 전달** — 저장소 Settings → Pages 에서 이 브랜치를 소스로 켜면
+  `https://<user>.github.io/<repo>/web/gemcraft.html` 로 접속할 수 있다.
+
+사용법은 등급·목표를 고르고 `계산 시작` 을 누르면 끝이다. 이후에는 화면에 뜬
+선택지 순위표에서, 인게임에 실제로 뜬 4개 중 **가장 위에 있는 것**을 눌러 주면
+상태가 자동으로 갱신된다. 리롤 기준선도 표시되므로 뜬 4개가 전부 기준선 아래면
+`다른 항목 보기` 를 쓰면 된다. 진행 중인 젬은 `현재 진행 중인 젬 입력…` 으로
+중간부터 시작할 수 있다.
+
+계산 엔진은 Python 판을 그대로 옮긴 것이고, 두 구현이 같은 값을 내는지
+테스트로 강제한다 (아래 [검증](#검증) 참고). 브라우저에서 영웅 젬 전체를 푸는 데
+약 0.4초 걸린다 (numpy 판보다 10배 빠르다 — 상태당 원소가 20여 개라 타입 배열 +
+삽입 정렬이 numpy 의 전체 argsort 보다 유리하다).
+
+## 명령행판
+
 ```
 python3 -m gemcraft.cli play --grade 희귀 --goal "target=4,4,0,0"
 ```
@@ -24,8 +56,6 @@ V(s, 0, r)         = objective(s)
 리롤의 가치 `V(s, n, r-1)` 은 같은 레이어의 더 낮은 `r` 이므로 `r` 오름차순으로
 풀면 고정점 반복 없이 한 번에 계산된다. 리롤을 연속으로 여러 번 쓰는 경우도 이
 재귀에 그대로 포함된다. 상태 7,500개 × 레이어 189개를 numpy 로 약 4초에 푼다.
-
-## 사용법
 
 ### `rank` — 지금 상태의 선택지 순위표
 
@@ -117,8 +147,11 @@ python3 -m gemcraft.cli sim --grade 희귀 --goal ancient --runs 50000
 ## 검증
 
 ```bash
-python3 -m pytest tests/ -q      # 18 passed
+npm install                      # 브라우저판 테스트용 jsdom (선택)
+python3 -m pytest tests/ -q      # 30 passed
 ```
+
+엔진 자체:
 
 - `test_bruteforce_matches_dp` — numpy DP 와 전이 테이블을 전혀 쓰지 않고
   확률표만 보고 순수 파이썬 재귀로 값 함수를 다시 계산해 비교한다 (`rel=1e-9`).
@@ -126,6 +159,21 @@ python3 -m pytest tests/ -q      # 18 passed
 - `test_simulation_matches_dp` — 3만 회 시뮬레이션의 실측 달성률이 DP 예측과 일치.
 - 그 외 확률표 합계, 증가 옵션이 Lv.5 를 넘지 않음, 시도/리롤에 대한 단조성,
   옵션 대칭성 등.
+
+브라우저판 (Python 판과 갈라지는 것을 막는 게 핵심):
+
+- `test_web_parity.py` — HTML 에서 엔진 블록만 떼어 node 로 실행하고, 6가지
+  (등급 × 목표 × p_good) 조합에 대해 상태값·선택지 가치·리롤 가치가 Python 과
+  `1e-9` 이내인지 본다. 규칙 테이블 27행도 통째로 비교하고, **추천 순위 자체가
+  같은지**까지 확인한다.
+- `test_web_ui.py` — jsdom 으로 HTML 을 실제로 띄워 버튼을 눌러 가며 32가지를
+  검사한다. 순위표 정렬, "선택 후" 표시값이 진짜 다음 상태의 값과 같은지,
+  리롤이 시도 횟수를 안 깎는지, 효과 변경 확인 흐름, 되돌리기, 끝까지 진행,
+  잘못된 입력 차단 등.
+
+브라우저판은 DOM 과 로직까지 검증했지만 **실제 브라우저에서의 시각적 렌더링은
+확인하지 못했다** (이 환경에 브라우저가 없다). CSS 는 flexbox/grid 만 쓰는
+보수적인 구성이지만, 배포 전에 한 번 열어 보는 것을 권한다.
 
 ### 외부 정합성
 
@@ -154,12 +202,21 @@ python3 -m pytest tests/ -q      # 18 passed
 ## 구조
 
 ```
-gemcraft/
-  rules.py       공식 확률표·상수 (패치 시 여기만 수정)
-  state.py       상태 인코딩, 유효성 행렬, 전이 테이블
-  objectives.py  목표 함수와 --goal 파서
-  solver.py      DP 및 정책 조회
-  simulate.py    정책 시뮬레이터
-  cli.py         명령행 인터페이스
+gemcraft/           Python 엔진
+  rules.py            공식 확률표·상수 (패치 시 여기부터 수정)
+  state.py            상태 인코딩, 유효성 행렬, 전이 테이블
+  objectives.py       목표 함수와 --goal 파서
+  solver.py           DP 및 정책 조회
+  simulate.py         정책 시뮬레이터
+  cli.py              명령행 인터페이스
+web/
+  gemcraft.html       배포용 단일 파일 (엔진 + UI, 외부 의존성 없음)
 tests/
+  test_gemcraft.py    엔진 검증 (브루트포스 대조 포함)
+  test_web_parity.py  JS 엔진 == Python 엔진
+  test_web_ui.py      jsdom 으로 UI 클릭 검사
+  ui_driver.js        UI 검사 항목 정의
 ```
+
+**규칙이 패치되면 `gemcraft/rules.py` 와 `web/gemcraft.html` 의 `RULES` 를 함께
+고쳐야 한다.** 한쪽만 고치면 `test_web_parity.py` 가 즉시 실패한다.
