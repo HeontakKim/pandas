@@ -30,7 +30,9 @@ import gzip
 import io
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -98,6 +100,93 @@ def _parse_time_fs(raw_value, raw_unit):
         return None
 
 
+UPSERT_SQL = """
+    INSERT INTO violations
+        (scope, check_type, cell_file, cell_line, count, first_fs, last_fs)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(scope, check_type, cell_file, cell_line) DO UPDATE SET
+        count    = count + excluded.count,
+        first_fs = MIN(IFNULL(first_fs, excluded.first_fs),
+                       IFNULL(excluded.first_fs, first_fs)),
+        last_fs  = MAX(IFNULL(last_fs,  excluded.last_fs),
+                       IFNULL(excluded.last_fs,  last_fs))
+"""
+
+
+def open_db(path, fresh=False):
+    """요약 DB 를 연다. fresh=True 면 새로 만든다."""
+    if fresh and os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA cache_size = -131072")  # 128MiB
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS violations (
+            scope       TEXT    NOT NULL,
+            check_type  TEXT    NOT NULL,
+            cell_file   TEXT    NOT NULL,
+            cell_line   INTEGER NOT NULL,   -- 없으면 -1
+            count       INTEGER NOT NULL,
+            first_fs    INTEGER,
+            last_fs     INTEGER,
+            PRIMARY KEY (scope, check_type, cell_file, cell_line)
+        ) WITHOUT ROWID;
+        """
+    )
+    # PK 의 선두 컬럼이 scope 이므로 scope 정확검색/prefix 검색이
+    # 그대로 인덱스를 탄다. 별도 인덱스는 필요 없다.
+    return conn
+
+
+def load(args):
+    """
+    C 판(strip_tv)이 만든 집계 TSV 를 SQLite 로 넣는다.
+    여러 개를 한꺼번에 주면 전부 하나의 DB 로 병합된다. 로그 파일이 많을 때
+    각 파일을 병렬로 strip 한 뒤 결과를 여기서 합치는 흐름이다.
+    """
+    conn = open_db(args.db, fresh=args.fresh)
+    files = rows = 0
+    batch = []
+
+    for path in args.aggfile:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if not ln or ln[0] == "#":
+                    continue
+                p = ln.rstrip("\n").split("\t")
+                if len(p) != 7:
+                    continue
+                try:
+                    batch.append((
+                        p[0], p[1], p[2], int(p[3]), int(p[4]),
+                        None if p[5] == "-1" else int(p[5]),
+                        None if p[6] == "-1" else int(p[6]),
+                    ))
+                except ValueError:
+                    continue
+                rows += 1
+                if len(batch) >= 50000:
+                    conn.executemany(UPSERT_SQL, batch)
+                    batch.clear()
+        files += 1
+
+    if batch:
+        conn.executemany(UPSERT_SQL, batch)
+    conn.commit()
+
+    tot, uniq, scopes = conn.execute(
+        "SELECT IFNULL(SUM(count),0), COUNT(*), COUNT(DISTINCT scope) FROM violations"
+    ).fetchone()
+    conn.execute("VACUUM")
+    conn.close()
+
+    print("적재 완료: 집계파일 %d개 / %s행 -> %s" % (files, format(rows, ","), args.db))
+    print("  누적 violation %s 건 / 고유 위치 %s 곳 / scope %s 개"
+          % (format(tot, ","), format(uniq, ","), format(scopes, ",")))
+
+
 class ViolationStore:
     """
     violation 을 두 가지 형태로 저장한다.
@@ -115,28 +204,7 @@ class ViolationStore:
         self.detail_path = detail_path
         self.keep_detail = keep_detail
 
-        if os.path.exists(db_path):
-            os.remove(db_path)
-        self.conn = sqlite3.connect(db_path)
-        self.conn.execute("PRAGMA journal_mode = OFF")
-        self.conn.execute("PRAGMA synchronous = OFF")
-        self.conn.execute("PRAGMA cache_size = -131072")  # 128MiB
-        self.conn.executescript(
-            """
-            CREATE TABLE violations (
-                scope       TEXT    NOT NULL,
-                check_type  TEXT    NOT NULL,
-                cell_file   TEXT    NOT NULL,
-                cell_line   INTEGER NOT NULL,   -- 없으면 -1
-                count       INTEGER NOT NULL,
-                first_fs    INTEGER,
-                last_fs     INTEGER,
-                PRIMARY KEY (scope, check_type, cell_file, cell_line)
-            ) WITHOUT ROWID;
-            """
-        )
-        # PK 의 선두 컬럼이 scope 이므로 scope 정확검색/prefix 검색이
-        # 그대로 인덱스를 탄다. 별도 인덱스는 필요 없다.
+        self.conn = open_db(db_path, fresh=True)
 
         self.pending = {}  # key -> [count, min_fs, max_fs]
         self.total = 0
@@ -196,20 +264,7 @@ class ViolationStore:
             )
             for k, v in self.pending.items()
         ]
-        self.conn.executemany(
-            """
-            INSERT INTO violations
-                (scope, check_type, cell_file, cell_line, count, first_fs, last_fs)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(scope, check_type, cell_file, cell_line) DO UPDATE SET
-                count    = count + excluded.count,
-                first_fs = MIN(IFNULL(first_fs, excluded.first_fs),
-                               IFNULL(excluded.first_fs, first_fs)),
-                last_fs  = MAX(IFNULL(last_fs,  excluded.last_fs),
-                               IFNULL(excluded.last_fs,  last_fs))
-            """,
-            rows,
-        )
+        self.conn.executemany(UPSERT_SQL, rows)
         self.conn.commit()
         self.pending.clear()
 
@@ -224,22 +279,40 @@ class ViolationStore:
             self._raw.close()
 
 
-def strip(args):
-    src = args.logfile
-    dst = args.out or (os.path.splitext(src)[0] + ".clean.log")
-    if os.path.abspath(src) == os.path.abspath(dst):
-        sys.exit("error: 입력과 출력 경로가 같습니다. --out 으로 다른 경로를 지정하세요.")
-
-    store = ViolationStore(
-        args.db,
-        args.detail,
-        compresslevel=args.compresslevel,
-        keep_detail=not args.no_detail,
-    )
-
+def _strip_python_file(src, dst, store, args):
+    """파일 하나를 파이썬으로 처리한다. (nbytes, nline, kept) 를 돌려준다."""
     t0 = time.time()
     nbytes = 0
+    nline = 0
     kept = 0
+
+    # ---- 진행률 표시 ---------------------------------------------------
+    # stderr 가 터미널이면 한 줄을 '\r' 로 덮어써서 갱신하고, 파일로
+    # 리다이렉트했으면 줄바꿈으로 쌓는다. (로그 파일에 '\r' 이 섞이면 지저분함)
+    total_bytes = os.path.getsize(src)
+    eol = "\r" if sys.stderr.isatty() else "\n"
+    tag = os.path.basename(src)[:20]
+
+    def report(final=False):
+        el = time.time() - t0
+        rate = nbytes / el if el else 0.0
+        pct = nbytes * 100.0 / total_bytes if total_bytes else 0.0
+        eta = (total_bytes - nbytes) / rate if rate else float("inf")
+        sys.stderr.write(
+            "%-20s [%5.1f%%] %13s lines %11s viol %9s %6.1f MB/s ETA %s   %s"
+            % (tag, pct, format(nline, ","), format(store.total, ","),
+               _human(nbytes), rate / 1e6, _hms(eta),
+               "\n" if final else eol)
+        )
+        sys.stderr.flush()
+
+    # 임계값에 도달했을 때만 report() 를 부른다. 비활성화 시 inf 를 넣어두면
+    # 루프 안에 별도의 'if enabled' 분기를 두지 않아도 된다.
+    INF = float("inf")
+    every_line = INF if args.no_progress else args.progress_lines
+    every_viol = INF if args.no_progress else args.progress_violations
+    line_mark = every_line
+    viol_mark = every_viol
 
     fin = open(src, "rb", buffering=IO_BUF)
     fout = open(dst, "wb", buffering=IO_BUF)
@@ -250,6 +323,7 @@ def strip(args):
         line = nxt()
         while line:
             nbytes += len(line)
+            nline += 1
 
             # ---- fast path -----------------------------------------------
             # 전체 줄의 99% 이상은 violation 이 아니다. bytes slice 비교는
@@ -257,8 +331,15 @@ def strip(args):
             if line[:8] != HEADER_PREFIX or HEADER_KEY not in line:
                 write(line)
                 kept += 1
+                if nline >= line_mark:          # 나눗셈(%)보다 비교가 싸다
+                    line_mark += every_line
+                    report()
                 line = nxt()
                 continue
+
+            if nline >= line_mark:
+                line_mark += every_line
+                report()
 
             # ---- violation 블록 후보 --------------------------------------
             block = []
@@ -270,13 +351,16 @@ def strip(args):
                 cur = nxt()
                 if not cur:
                     break
-                nbytes += len(cur)
 
-                # 다음 violation 헤더나 빈 줄을 만나면 블록 종료
+                # 다음 violation 헤더나 빈 줄을 만나면 블록 종료.
+                # 이 줄은 nextline 으로 되돌려져 루프 상단에서 다시 처리되므로
+                # 여기서 세면 이중 계산이 된다. (모든 줄은 정확히 한 번만 센다)
                 if _blank(cur) or (cur[:8] == HEADER_PREFIX and HEADER_KEY in cur):
                     nextline = cur
                     break
 
+                nbytes += len(cur)
+                nline += 1
                 block.append(cur)
 
                 if scope is None:
@@ -293,10 +377,9 @@ def strip(args):
                     m = RE_TIME.search(cur)
                     if m:
                         time_fs = _parse_time_fs(m.group(1), m.group(2))
-                        # Time 은 블록의 마지막 줄이다.
+                        # Time 은 블록의 마지막 줄이다. 그 다음 줄은 되돌려
+                        # 보내므로 여기서 세지 않는다.
                         nextline = nxt()
-                        if nextline:
-                            nbytes += len(nextline)
                         break
                 if check is None:
                     m = RE_CHECK.search(cur)
@@ -322,42 +405,195 @@ def strip(args):
                 time_fs,
             )
 
+            if store.total >= viol_mark:
+                viol_mark += every_viol
+                report()
+
             # 블록 뒤의 빈 줄도 같이 제거한다 (--keep-blank 로 유지 가능)
             if not args.keep_blank:
                 n = 0
                 while nextline and _blank(nextline) and n < MAX_TRAILING_BLANK:
+                    # 이 빈 줄은 여기서 버려지므로(되돌아가지 않으므로) 센다
+                    nbytes += len(nextline)
+                    nline += 1
                     nextline = nxt()
-                    if nextline:
-                        nbytes += len(nextline)
                     n += 1
 
             line = nextline if nextline else nxt()
     finally:
         fout.close()
         fin.close()
+
+    if not args.no_progress:
+        report(final=True)   # 마지막 진행률을 확정 출력하고 '\r' 줄을 닫는다
+
+    return nbytes, nline, kept
+
+
+# ---------------------------------------------------------------------------
+# C 엔진 연동
+# ---------------------------------------------------------------------------
+C_EXE = "strip_tv"
+C_SRC = "strip_timing_violations.c"
+
+
+def find_or_build_c(quiet=False):
+    """
+    C 실행파일을 찾고, 없거나 소스보다 오래됐으면 컴파일한다.
+    컴파일러가 없거나 실패하면 None 을 돌려준다(파이썬으로 폴백).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    exe = os.path.join(here, C_EXE)
+    src = os.path.join(here, C_SRC)
+
+    if os.path.exists(exe):
+        if not os.path.exists(src) or os.path.getmtime(exe) >= os.path.getmtime(src):
+            return exe
+    if not os.path.exists(src):
+        return None
+
+    for cc in ("cc", "gcc", "clang"):
+        if not shutil.which(cc):
+            continue
+        if not quiet:
+            sys.stderr.write("[빌드] %s -O2 -o %s\n" % (cc, C_EXE))
+        r = subprocess.run([cc, "-O2", "-o", exe, src],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode == 0:
+            return exe
+        sys.stderr.write("[빌드 실패] %s\n" % r.stderr.decode("utf-8", "replace")[:500])
+        return None
+    return None
+
+
+def _strip_with_c(args, exe):
+    """C 엔진으로 전부 처리한 뒤 집계를 DB 로 적재한다."""
+    jobs = []
+    for src in args.logfile:
+        dst = args.out or (os.path.splitext(src)[0] + ".clean.log")
+        agg = src + ".agg"
+        if os.path.abspath(src) == os.path.abspath(dst):
+            sys.exit("error: 입력과 출력 경로가 같습니다: %s" % src)
+        jobs.append((src, dst, agg))
+
+    cmdbase = [exe]
+    if args.no_progress:
+        cmdbase.append("--no-progress")
+    if args.keep_blank:
+        cmdbase.append("--keep-blank")
+    cmdbase += ["--progress-lines", str(args.progress_lines),
+                "--progress-violations", str(args.progress_violations)]
+
+    t0 = time.time()
+    par = max(1, args.jobs)
+    running = []
+    pending = list(jobs)
+    failed = []
+
+    # 파일 여러 개를 코어 수만큼 동시에 돌린다.
+    while pending or running:
+        while pending and len(running) < par:
+            src, dst, agg = pending.pop(0)
+            p = subprocess.Popen(cmdbase + [src, "-o", dst, "-a", agg])
+            running.append((p, src))
+        p, src = running.pop(0)
+        rc = p.wait()
+        if rc != 0:
+            failed.append(src)
+
+    if failed:
+        sys.exit("error: C 엔진 처리 실패: %s" % ", ".join(failed))
+
+    scan_dt = time.time() - t0
+
+    # 집계를 DB 로 적재
+    class _A:
+        pass
+    la = _A()
+    la.aggfile = [j[2] for j in jobs]
+    la.db = args.db
+    la.fresh = True
+    load(la)
+    sys.stdout.flush()   # load() 는 stdout, 아래 요약은 stderr -> 순서 보장
+
+    if not args.keep_agg:
+        for _, _, agg in jobs:
+            try:
+                os.remove(agg)
+            except OSError:
+                pass
+
+    total_in = sum(os.path.getsize(s) for s, _, _ in jobs)
+    sys.stderr.write(
+        "\n[strip 완료 / C 엔진] 스캔 %.1fs (%.1f MB/s), 전체 %.1fs\n"
+        "  입력      : %d개 파일 %s\n"
+        "  정리 로그 : %s\n"
+        "  요약 DB   : %-28s %s\n"
+        % (scan_dt, total_in / 1e6 / scan_dt if scan_dt else 0,
+           time.time() - t0,
+           len(jobs), _human(total_in),
+           ", ".join(os.path.basename(d) for _, d, _ in jobs[:3])
+           + (" ..." if len(jobs) > 3 else ""),
+           args.db, _human(os.path.getsize(args.db)))
+    )
+    if not args.no_detail:
+        sys.stderr.write(
+            "  참고: C 엔진은 gzip 상세 레코드를 만들지 않습니다.\n"
+            "        개별 타임스탬프까지 필요하면 --engine python 을 쓰세요.\n"
+        )
+
+
+def strip(args):
+    """
+    엔진을 고르고 전체 흐름을 한 번에 돌린다.
+      auto   : C 가 쓸 수 있으면 C, 아니면 파이썬
+      c      : C 강제 (없으면 오류)
+      python : 파이썬 강제 (gzip 상세 레코드까지 생성)
+    """
+    exe = None
+    if args.engine in ("auto", "c"):
+        exe = find_or_build_c(quiet=args.no_progress)
+        if exe is None and args.engine == "c":
+            sys.exit("error: C 엔진을 쓸 수 없습니다 (컴파일러 또는 %s 없음)" % C_SRC)
+    if exe is not None:
+        return _strip_with_c(args, exe)
+
+    if args.engine == "auto":
+        sys.stderr.write("[안내] C 엔진을 쓸 수 없어 파이썬으로 처리합니다 (10배 이상 느림).\n")
+
+    if args.out and len(args.logfile) > 1:
+        sys.exit("error: --out 은 입력이 하나일 때만 쓸 수 있습니다.")
+
+    store = ViolationStore(
+        args.db, args.detail,
+        compresslevel=args.compresslevel,
+        keep_detail=not args.no_detail,
+    )
+    t0 = time.time()
+    tb = tl = tk = 0
+    try:
+        for src in args.logfile:
+            dst = args.out or (os.path.splitext(src)[0] + ".clean.log")
+            if os.path.abspath(src) == os.path.abspath(dst):
+                sys.exit("error: 입력과 출력 경로가 같습니다: %s" % src)
+            b, l, k = _strip_python_file(src, dst, store, args)
+            tb += b; tl += l; tk += k
+    finally:
         store.close()
 
     dt = time.time() - t0
-    out_size = os.path.getsize(dst)
-    db_size = os.path.getsize(args.db)
-    det_size = os.path.getsize(args.detail) if not args.no_detail else 0
-
     sys.stderr.write(
-        "\n[strip 완료] %.1fs (%.1f MB/s)\n"
-        "  입력      : %-28s %12s\n"
-        "  정리 로그 : %-28s %12s\n"
-        "  요약 DB   : %-28s %12s\n"
-        "  상세(gz)  : %-28s %12s\n"
-        "  violation : %d 건  (남긴 줄 %d)\n"
-        % (
-            dt,
-            nbytes / 1e6 / dt if dt else 0,
-            src, _human(nbytes),
-            dst, _human(out_size),
-            args.db, _human(db_size),
-            args.detail if not args.no_detail else "-", _human(det_size),
-            store.total, kept,
-        )
+        "\n[strip 완료 / 파이썬 엔진] %.1fs (%.1f MB/s)\n"
+        "  입력      : %d개 파일 %s\n"
+        "  요약 DB   : %-28s %s\n"
+        "  상세(gz)  : %-28s %s\n"
+        "  violation : %s 건  (남긴 줄 %s)\n"
+        % (dt, tb / 1e6 / dt if dt else 0,
+           len(args.logfile), _human(tb),
+           args.db, _human(os.path.getsize(args.db)),
+           args.detail if not args.no_detail else "-",
+           _human(os.path.getsize(args.detail)) if not args.no_detail else "-",
+           format(store.total, ","), format(tk, ","))
     )
     if store.unparsed:
         sys.stderr.write(
@@ -371,6 +607,13 @@ def _human(n):
         if n < 1024 or u == "TB":
             return "%.1f %s" % (n, u)
         n /= 1024.0
+
+
+def _hms(sec):
+    if sec < 0 or sec != sec or sec == float("inf"):
+        return "--:--:--"
+    sec = int(sec)
+    return "%02d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
 
 
 def _fs(v):
@@ -440,9 +683,15 @@ def main():
         description="sim.log 에서 timing violation 을 분리/압축/색인한다.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("strip", help="로그에서 violation 제거 + 저장")
-    s.add_argument("logfile")
-    s.add_argument("--out", help="정리된 로그 (기본: <입력>.clean.log)")
+    s = sub.add_parser("strip", help="로그에서 violation 제거 + 저장 (C 엔진 자동 사용)")
+    s.add_argument("logfile", nargs="+", help="sim.log (여러 개 지정 가능)")
+    s.add_argument("--engine", choices=("auto", "c", "python"), default="auto",
+                   help="auto=C 우선(기본), c=C 강제, python=파이썬 강제")
+    s.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                   metavar="N", help="C 엔진에서 동시 처리할 파일 수 (기본: 코어 수)")
+    s.add_argument("--keep-agg", action="store_true",
+                   help="C 엔진의 중간 집계 파일(.agg)을 지우지 않음")
+    s.add_argument("--out", help="정리된 로그 (기본: <입력>.clean.log, 입력 1개일 때만)")
     s.add_argument("--db", default="violations.db", help="SQLite 요약 DB")
     s.add_argument("--detail", default="violations.tsv.gz", help="gzip 상세 레코드")
     s.add_argument("--no-detail", action="store_true",
@@ -451,7 +700,18 @@ def main():
                    help="gzip 압축 레벨 1(빠름)~9(작음), 기본 6")
     s.add_argument("--keep-blank", action="store_true",
                    help="violation 블록 뒤의 빈 줄을 지우지 않음")
+    s.add_argument("--progress-lines", type=int, default=1_000_000,
+                   metavar="N", help="N 줄마다 진행률 출력 (기본: 1000000)")
+    s.add_argument("--progress-violations", type=int, default=1000,
+                   metavar="N", help="violation N 건마다 진행률 출력 (기본: 1000)")
+    s.add_argument("--no-progress", action="store_true", help="진행률 출력 끄기")
     s.set_defaults(func=strip)
+
+    ld = sub.add_parser("load", help="C 판이 만든 집계 TSV 를 DB 로 적재/병합")
+    ld.add_argument("aggfile", nargs="+", help="집계 TSV (여러 개 지정 시 병합)")
+    ld.add_argument("--db", default="violations.db")
+    ld.add_argument("--fresh", action="store_true", help="기존 DB 를 지우고 새로 만듦")
+    ld.set_defaults(func=load)
 
     q = sub.add_parser("query", help="Scope 로 검색")
     q.add_argument("scope")

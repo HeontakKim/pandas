@@ -1,0 +1,10 @@
+# strip_timing_violations.py 가 자동으로 빌드하는 C 실행파일
+strip_tv
+
+# 처리 결과물
+*.clean.log
+*.agg
+violations.db
+violations.tsv.gz
+
+__pycache__/
