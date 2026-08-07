@@ -5,40 +5,38 @@
 가공은 유한 지평 마르코프 결정 과정이다.
 
 * 상태: (젬 속성 상태, 남은 가공 시도 횟수 ``n``, 남은 다른 항목 보기 횟수 ``r``)
-* 매 턴 4개의 선택지가 확률적으로 제시된다.
-* 행동: 4개 중 하나를 고르거나(시도 1회 소모), '다른 항목 보기'를 쓴다
+* 매 턴 중복 없는 4개의 가능성이 확률적으로 제시된다.
+* 행동: 가공(4개 중 하나가 각 25%로 무작위 적용), '다른 항목 보기', 가공 완료
   (시도는 소모하지 않고 ``r`` 만 1 줄어든 뒤 4개를 다시 뽑는다).
 
 따라서 값 함수는 아래 두 식으로 정확히 계산된다.
 
-    Q(s, n, r, 선택지) = V(s', n-1, r')                     # 선택지 적용 후
-    V(s, n, r)         = E_hand[ max( max_{o∈hand} Q(s,n,r,o),
-                                      V(s, n, r-1) ) ]      # 리롤 가능할 때
-    V(s, n, 0)         = E_hand[ max_{o∈hand} Q(s,n,0,o) ]
+    process(hand)      = sum(Q(s,n,r,o) for o in hand) / 4
+    V(s, n, r)         = E_hand[max(process(hand), reroll, complete)]
     V(s, 0, r)         = objective(s)
 
 ``V(s,n,r-1)`` 은 같은 레이어의 더 낮은 ``r`` 이므로 ``r`` 오름차순으로 풀면
 고정점 반복 없이 한 번에 계산된다. 리롤을 여러 번 연속으로 쓰는 것도
 이 재귀에 자연히 포함된다.
 
-선택지 추출 모델
-----------------
-공식 확률표는 선택지 하나하나에 확률을 부여하고 합이 정확히 100% 다.
-이를 **4개 슬롯이 각각 독립적으로 이 분포에서 뽑힌다**(중복 등장 가능)고
-해석한다. 만약 실제로는 중복 없이 4개를 뽑는다면 값 함수가 미세하게
-달라지지만, 눈앞의 4장 중 무엇을 고를지는 ``Q`` 의 대소 관계로 결정되고
-그 순서는 이 가정에 거의 영향을 받지 않는다.
+공식 규칙대로 한 손패 안에는 같은 가능성이 중복되지 않는다. 확률표의 가중치로
+하나씩 뽑고 이미 뽑은 항목을 제외한 뒤 재정규화하는 비복원 추출로 모델링한다.
+손패 공간이 크므로 사전 상태의 기대값은 상태마다 고정된 결정적 표본으로 계산한다.
+눈앞에 표시된 실제 4개에 대한 가공/리롤/완료 비교는 근사가 아닌 정확한 계산이다.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
 from . import rules, state as st
 from .objectives import Objective
 from .rules import HAND_SIZE
+
+HAND_SAMPLES = 24
 
 
 @dataclass(frozen=True)
@@ -48,6 +46,14 @@ class OptionValue:
     value: float
     available: bool
     appear_prob: float
+
+
+@dataclass(frozen=True)
+class HandDecision:
+    action: str
+    process_value: float
+    reroll_value: float | None
+    complete_value: float | None
 
 
 class Policy:
@@ -64,7 +70,6 @@ class Policy:
             self.attempts = int(attempts)
         self.max_rerolls = self.base_rerolls + 2 * self.attempts
 
-        self._probs = st.hand_probabilities()
         self._succ_a, self._succ_b, self._mix_a, self._gained = st.transitions(self.p_good)
         self._gained_col = self._gained[0]  # 리롤 획득량은 상태와 무관
         self._values = self._solve(objective.terminal_values())
@@ -91,21 +96,46 @@ class Policy:
         rows = np.minimum(r + self._gained_col, self.max_rerolls)
         return mix * prev[rows, a] + (1.0 - mix) * prev[rows, b]
 
-    def _hand_value(self, q: np.ndarray, reroll_value: np.ndarray | None) -> np.ndarray:
-        """E[ max(손패 최고가치, 리롤 가치) ] — 4장을 독립 추출한다고 가정."""
-        order = np.argsort(-q, axis=1, kind="stable")
-        q_sorted = np.take_along_axis(q, order, axis=1)
-        p_sorted = np.take_along_axis(self._probs, order, axis=1)
+    @staticmethod
+    @lru_cache(maxsize=2)
+    def _sample_hands(attempts_left: int) -> np.ndarray:
+        """상태별 결정적 비복원 손패 표본. shape=(state, sample, 4)."""
+        attempts_left = 1 if attempts_left == 1 else 2
+        valid = st.validity(attempts_left)
+        out = np.empty((st.N_ATTR_STATES, HAND_SAMPLES, HAND_SIZE), dtype=np.int16)
+        mask32 = (1 << 32) - 1
+        for s in range(st.N_ATTR_STATES):
+            choices = np.flatnonzero(valid[s])
+            weights = st.BASE_WEIGHTS[choices]
+            for k in range(HAND_SAMPLES):
+                remaining = choices.tolist()
+                remaining_w = weights.tolist()
+                seed = (0x9E3779B9 ^ (s * 0x85EBCA6B) ^ (k * 0xC2B2AE35)
+                        ^ (attempts_left * 0x27D4EB2F)) & mask32
+                for d in range(HAND_SIZE):
+                    seed = (1664525 * seed + 1013904223) & mask32
+                    target = (seed / 2**32) * sum(remaining_w)
+                    acc = 0.0
+                    pick = len(remaining) - 1
+                    for j, weight in enumerate(remaining_w):
+                        acc += weight
+                        if target < acc:
+                            pick = j
+                            break
+                    out[s, k, d] = remaining.pop(pick)
+                    remaining_w.pop(pick)
+        return out
 
-        # 손패 최고가치가 정확히 i번째 선택지일 확률
-        cum = np.cumsum(p_sorted, axis=1)
-        tail_before = np.clip(1.0 - (cum - p_sorted), 0.0, 1.0)
-        tail_after = np.clip(1.0 - cum, 0.0, 1.0)
-        # 부동소수점 오차로 아주 작은 음수 가중치가 생길 수 있어 0으로 눌러 준다.
-        weight = np.maximum(tail_before ** HAND_SIZE - tail_after ** HAND_SIZE, 0.0)
-
-        best = q_sorted if reroll_value is None else np.maximum(q_sorted, reroll_value[:, None])
-        return (best * weight).sum(axis=1)
+    def _hand_value(self, q: np.ndarray, reroll_value: np.ndarray | None,
+                    complete_value: np.ndarray | None, attempts_left: int) -> np.ndarray:
+        hands = self._sample_hands(attempts_left)
+        rows = np.arange(st.N_ATTR_STATES)[:, None, None]
+        process = q[rows, hands].mean(axis=2)
+        if reroll_value is not None:
+            process = np.maximum(process, reroll_value[:, None])
+        if complete_value is not None:
+            process = np.maximum(process, complete_value[:, None])
+        return process.mean(axis=1)
 
     def _solve(self, terminal: np.ndarray) -> np.ndarray:
         n_layers = self.attempts + 1
@@ -119,10 +149,13 @@ class Policy:
             # '다른 항목 보기'는 가공을 1회 진행한 뒤부터 쓸 수 있다.
             turn = self.attempts - n
             can_reroll = turn >= rules.REROLL_AVAILABLE_FROM_TURN
+            can_complete = turn >= 1
             for r in range(n_rerolls):
                 q = self._q_matrix(n, r)
                 reroll_value = values[n, r - 1] if (can_reroll and r >= 1) else None
-                values[n, r] = self._hand_value(q, reroll_value)
+                complete_value = terminal if can_complete else None
+                values[n, r] = self._hand_value(
+                    q, reroll_value, complete_value, n)
         return values
 
     def _check(self, gem: st.GemState) -> None:
@@ -151,8 +184,8 @@ class Policy:
             raise ValueError("남은 가공 시도 횟수가 0 입니다.")
         idx = gem.attr_index()
         q = self._q_row(idx, gem.attempts_left, gem.rerolls_left)
-        probs = self._probs[idx]
-        valid = st.VALID[idx]
+        probs = st.hand_probabilities(gem.attempts_left)[idx]
+        valid = st.validity(gem.attempts_left)[idx]
         rows = [
             OptionValue(oid, st.OPTION_LABELS[oid], float(q[i]), bool(valid[i]), float(probs[i]))
             for i, oid in enumerate(st.OPTION_IDS)
@@ -171,21 +204,28 @@ class Policy:
             return None
         return float(self._values[gem.attempts_left, gem.rerolls_left - 1, gem.attr_index()])
 
-    def recommend(self, gem: st.GemState, hand: list[str]) -> tuple[str, list[OptionValue]]:
-        """제시된 4장 중 최선의 선택을 고른다.
-
-        반환값은 ``("리롤" 또는 선택지 id, 손패 각 장의 가치)``.
-        """
+    def recommend(self, gem: st.GemState, hand: list[str]) -> tuple[HandDecision, list[OptionValue]]:
+        """실제 손패에서 가공(25%씩), 리롤, 완료 중 최선의 행동을 고른다."""
+        if len(hand) != HAND_SIZE or len(set(hand)) != HAND_SIZE:
+            raise ValueError("손패에는 서로 다른 가능성 4개가 필요합니다.")
         ranked = {row.option_id: row for row in self.option_values(gem)}
         unknown = [oid for oid in hand if oid not in ranked]
         if unknown:
             raise ValueError(f"알 수 없는 선택지 id: {', '.join(unknown)}")
         cards = [ranked[oid] for oid in hand]
-        best = max(cards, key=lambda row: row.value)
+        if not all(card.available for card in cards):
+            raise ValueError("현재 상태에서 등장할 수 없는 가능성이 포함되어 있습니다.")
+        process = sum(card.value for card in cards) / HAND_SIZE
         rv = self.reroll_value(gem)
-        if rv is not None and rv > best.value:
-            return "reroll", cards
-        return best.option_id, cards
+        turn = self.attempts - gem.attempts_left
+        complete = float(self.objective.terminal_values()[gem.attr_index()]) if turn >= 1 else None
+        candidates = [("process", process)]
+        if rv is not None:
+            candidates.append(("reroll", rv))
+        if complete is not None:
+            candidates.append(("complete", complete))
+        action = max(candidates, key=lambda item: item[1])[0]
+        return HandDecision(action, process, rv, complete), cards
 
 
 def initial_state(grade: str, eff1_good: bool = True, eff2_good: bool = True) -> st.GemState:

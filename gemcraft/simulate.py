@@ -49,7 +49,6 @@ def simulate(policy: Policy, runs: int = 20_000, seed: int = 0,
     start = start or initial_state(policy.grade)
     policy._check(start)
 
-    cumulative = np.cumsum(policy._probs, axis=1)
     terminal = policy.objective.terminal_values()
     gained = policy._gained_col
     mix_a = policy._mix_a
@@ -68,24 +67,38 @@ def simulate(policy: Policy, runs: int = 20_000, seed: int = 0,
         while n > 0:
             turn = policy.attempts - n
             q = policy._q_row(idx, n, r)
-            hand = np.searchsorted(cumulative[idx], rng.random(rules.HAND_SIZE))
-            best = hand[int(np.argmax(q[hand]))]
+            valid = st.validity(n)[idx]
+            choices = np.flatnonzero(valid)
+            weights = st.BASE_WEIGHTS[choices].astype(float)
+            hand = []
+            for _draw in range(rules.HAND_SIZE):
+                weights /= weights.sum()
+                pos = int(rng.choice(len(choices), p=weights))
+                hand.append(int(choices[pos]))
+                choices = np.delete(choices, pos)
+                weights = np.delete(weights, pos)
+            process_value = float(q[hand].mean())
 
             if r >= 1 and turn >= rules.REROLL_AVAILABLE_FROM_TURN:
                 reroll_value = policy._values[n, r - 1, idx]
-                if reroll_value > q[best]:
+                if reroll_value > process_value:
                     r -= 1
                     reroll_total += 1
                     continue
 
+            if turn >= 1 and terminal[idx] > process_value:
+                break
+
+            applied = hand[int(rng.integers(rules.HAND_SIZE))]
+
             cost_mod = int(st.ATTR_COST[idx])
             gold_total += rules.BASE_COST_GOLD * (1 + cost_mod)
 
-            if mix_a[idx, best] < 1.0 and rng.random() >= mix_a[idx, best]:
-                idx = int(succ_b[idx, best])
+            if mix_a[idx, applied] < 1.0 and rng.random() >= mix_a[idx, applied]:
+                idx = int(succ_b[idx, applied])
             else:
-                idx = int(succ_a[idx, best])
-            r = min(r + int(gained[best]), policy.max_rerolls)
+                idx = int(succ_a[idx, applied])
+            r = min(r + int(gained[applied]), policy.max_rerolls)
             n -= 1
 
         score_total += float(terminal[idx])

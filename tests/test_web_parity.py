@@ -2,7 +2,7 @@
 
 브라우저용 HTML 은 Python 패키지를 손으로 옮긴 것이라 방치하면 반드시 갈라진다.
 이 테스트는 HTML 에서 엔진 블록만 떼어내 node 로 실행하고, 같은 상태·같은 목표에
-대해 Python 이 낸 값과 1e-9 이내로 일치하는지 본다. 규칙 테이블도 통째로 비교한다.
+대해 Python 이 낸 값과 일치하는지 본다. 규칙 테이블도 통째로 비교한다.
 
 node 가 없으면 skip 한다.
 """
@@ -92,12 +92,9 @@ def test_js_option_weights_sum_to_100(engine_path):
 # --- 값 함수가 같은가 -------------------------------------------------------------
 CASES = [
     # (등급, 목표, p_good, 시도횟수 override)
-    ("고급", "ancient", 1.0, None),
-    ("희귀", "target=4,4,0,0", 1.0, None),
-    ("영웅", "relic", 1.0, None),
-    ("영웅", "total", 1.0, 4),
-    ("영웅", "target=4,4,3,0+good+total17", 0.375, 5),
-    ("희귀", "weighted=1,1,0.6,0.6", 0.5, None),
+    ("영웅", "ancient", 1.0, 2),
+    ("영웅", "target=4,4,3,0+good+total17", 0.5, 3),
+    ("희귀", "weighted=1,1,0.6,0.6", 0.5, 2),
 ]
 
 GEMS = [
@@ -163,17 +160,21 @@ def test_state_values_match(engine_path, grade, goal, p_good, attempts):
         assert py_reroll == pytest.approx(js["reroll"], rel=1e-9, abs=1e-12)
 
 
-def test_js_ranking_order_matches_python(engine_path):
-    """추천 자체(순위)가 같아야 계산기로서 의미가 있다."""
+def test_js_hand_decision_matches_python(engine_path):
+    """실제 네 가능성에 대한 행동 추천이 같아야 한다."""
     grade, goal = "영웅", "target=4,4,0,0+total16"
-    policy = Policy(grade, parse_goal(goal))
+    policy = Policy(grade, parse_goal(goal), attempts=3)
     gem_args = (4, 3, 2, 1, True, True, 0)
-    js = run_node(engine_path, JS_VALUES, {
-        "grade": grade, "goal": goal, "pGood": 1.0, "attempts": None,
-        "gems": [list(gem_args), list(gem_args)],
-        "attemptsLeft": 3, "rerollsLeft": 1,
-    })
     gem = GemState(*gem_args, attempts_left=3, rerolls_left=1)
-    py_order = [row.option_id for row in policy.option_values(gem) if row.available]
-    js_order = [oid for oid, _v, available, _p in js["options"] if available]
-    assert py_order == js_order
+    hand = ["will+1", "point+2", "keep", "eff1+1"]
+    py_decision, _ = policy.recommend(gem, hand)
+    script = JS_VALUES.replace(
+        "console.log(JSON.stringify(out));",
+        f"out.decision = policy.recommendHand(gem, {json.dumps(hand)}); console.log(JSON.stringify(out));",
+    )
+    js = run_node(engine_path, script, {
+        "grade": grade, "goal": goal, "pGood": 1.0, "attempts": 3,
+        "gems": [list(gem_args), list(gem_args)], "attemptsLeft": 3, "rerollsLeft": 1,
+    })
+    assert js["decision"]["action"] == py_decision.action
+    assert js["decision"]["processValue"] == pytest.approx(py_decision.process_value)

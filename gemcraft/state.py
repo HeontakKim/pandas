@@ -140,9 +140,26 @@ def _validity_matrix() -> np.ndarray:
 VALID = _validity_matrix()
 
 
-def hand_probabilities() -> np.ndarray:
+def validity(attempts_left: int) -> np.ndarray:
+    """남은 가공 횟수까지 반영한 선택지 유효성.
+
+    공식 확률표상 마지막 가공 차수에는 다음 차수에만 영향을 주는 비용 변경과
+    다른 항목 보기 증가가 등장하지 않는다.
+    """
+    if attempts_left < 1:
+        raise ValueError("남은 가공 횟수는 1 이상이어야 합니다.")
+    if attempts_left != 1:
+        return VALID
+    out = VALID.copy()
+    for oid in ("cost+", "cost-", "reroll+1", "reroll+2"):
+        out[:, OPTION_INDEX[oid]] = False
+    return out
+
+
+def hand_probabilities(attempts_left: int = 2) -> np.ndarray:
     """shape (N_ATTR_STATES, N_OPTIONS) — 상태별로 재정규화된 선택지 등장 확률."""
-    weights = np.where(VALID, BASE_WEIGHTS[None, :], 0.0)
+    valid = validity(attempts_left)
+    weights = np.where(valid, BASE_WEIGHTS[None, :], 0.0)
     total = weights.sum(axis=1, keepdims=True)
     if not np.all(total > 0):
         raise AssertionError("모든 선택지가 미등장 조건에 걸리는 상태가 존재합니다.")
@@ -190,7 +207,15 @@ def transitions(p_good: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
             gd_bad[slot] = False
             succ_a[:, col] = enc(levels, gd_good, cost)
             succ_b[:, col] = enc(levels, gd_bad, cost)
-            mix_a[:, col] = p_good
+            # 효과 변경 시 기존 효과와 반대편 슬롯의 효과는 후보에서 빠진다.
+            # 각 젬 세부 타입에는 서로 다른 효과 4종이 있으므로, 원하는 효과의
+            # 전체 비율(p_good)과 두 슬롯의 현재 적합 여부만으로 조건부 확률을
+            # 정확히 구할 수 있다: (원하는 효과 수 - 제외된 원하는 효과 수) / 2.
+            desired = 4.0 * p_good
+            mix_a[:, col] = np.clip(
+                (desired - good[0].astype(float) - good[1].astype(float)) / 2.0,
+                0.0, 1.0,
+            )
         elif kind == "cost":
             cs = np.clip(cost + param, rules.COST_MOD_MIN, rules.COST_MOD_MAX)
             succ_a[:, col] = succ_b[:, col] = enc(levels, good, cs)

@@ -55,28 +55,28 @@ def _state_line(gem: st.GemState) -> str:
     )
 
 
-def print_ranking(policy: Policy, gem: st.GemState) -> None:
+def print_ranking(policy: Policy, gem: st.GemState, hand: list[str] | None = None) -> None:
     print(f"\n  {_state_line(gem)}")
     print(f"  현재 기대치: {_fmt(policy, policy.state_value(gem))}"
           f"   ({policy.objective.description})")
 
-    reroll = policy.reroll_value(gem)
     rows = [row for row in policy.option_values(gem) if row.available]
 
-    print(f"\n  {'순위':<4}{'선택지':<26}{'등장률':>8}{'선택 후':>12}")
+    print(f"\n  {'ID':<12}{'가능성':<26}{'기준률':>8}{'적용 후':>12}")
     print("  " + "-" * 50)
-    for rank, row in enumerate(rows, 1):
-        marker = " ←리롤 기준선" if reroll is not None and row.value < reroll \
-            and (rank == 1 or rows[rank - 2].value >= reroll) else ""
-        print(f"  {rank:<4}{row.label:<26}{row.appear_prob * 100:7.2f}%"
-              f"{_fmt(policy, row.value):>12}{marker}")
-
-    if reroll is not None:
-        print(f"\n  다른 항목 보기(리롤) 가치: {_fmt(policy, reroll)}"
-              f"  → 4장 중 최고가 이보다 낮으면 리롤이 이득")
-    elif gem.rerolls_left > 0:
-        print("\n  (다른 항목 보기는 가공을 1회 진행한 뒤부터 사용할 수 있습니다)")
-    print("\n  뜬 4장 중 위 표에서 가장 순위가 높은 것을 고르면 그것이 최적입니다.")
+    for row in rows:
+        print(f"  {row.option_id:<12}{row.label:<26}{row.appear_prob * 100:7.2f}%"
+              f"{_fmt(policy, row.value):>12}")
+    if hand:
+        decision, _cards = policy.recommend(gem, hand)
+        names = {"process": "가공하기", "reroll": "다른 항목 보기", "complete": "가공 완료"}
+        print(f"\n  추천: {names[decision.action]} · 가공 기대치 {_fmt(policy, decision.process_value)}")
+        if decision.reroll_value is not None:
+            print(f"  다른 항목 보기 가치: {_fmt(policy, decision.reroll_value)}")
+        if decision.complete_value is not None:
+            print(f"  지금 완료 가치: {_fmt(policy, decision.complete_value)}")
+    else:
+        print("\n  --hand에 인게임의 서로 다른 가능성 4개 ID를 쉼표로 입력하세요.")
 
 
 def _ask(prompt: str) -> str:
@@ -97,28 +97,30 @@ def run_interactive(policy: Policy, gem: st.GemState) -> None:
 
     while gem.attempts_left > 0:
         print_ranking(policy, gem)
-        answer = _ask("\n> 고른 선택지: ").strip().lower()
+        answer = _ask("\n> 표시된 가능성 4개 (쉼표 구분): ").strip().lower()
         if answer in ("q", "quit", "exit"):
             return
-        if answer in ("r", "reroll"):
-            reroll = policy.reroll_value(gem)
-            if reroll is None:
-                print("  ! 지금은 다른 항목 보기를 쓸 수 없습니다.")
-                continue
-            gem = st.GemState(**{**gem.__dict__, "rerolls_left": gem.rerolls_left - 1})
-            continue
-
         try:
-            option_id = resolve_option_id(answer)
+            hand = [resolve_option_id(token) for token in answer.split(",")]
+            decision, _cards = policy.recommend(gem, hand)
         except ValueError as exc:
             print(f"  ! {exc}")
             continue
-
-        col = st.OPTION_INDEX[option_id]
-        if not st.VALID[gem.attr_index(), col]:
-            print(f"  ! '{st.OPTION_LABELS[option_id]}' 는 이 상태에서 등장할 수 없는 선택지입니다.")
+        print(f"  → 추천: {decision.action}")
+        if decision.action == "reroll":
+            gem = st.GemState(**{**gem.__dict__, "rerolls_left": gem.rerolls_left - 1})
             continue
-
+        if decision.action == "complete":
+            gem = st.GemState(**{**gem.__dict__, "attempts_left": 0})
+            break
+        applied = _ask("  가공 후 실제 적용된 가능성 ID: ")
+        try:
+            option_id = resolve_option_id(applied)
+            if option_id not in hand:
+                raise ValueError("입력한 네 가능성 중 하나를 입력해야 합니다.")
+        except ValueError as exc:
+            print(f"  ! {exc}")
+            continue
         gem = apply_option(gem, option_id, policy)
 
     print(f"\n{'=' * 56}")
@@ -191,7 +193,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eff1-bad", action="store_true", help="첫번째 효과가 원하지 않는 효과")
     parser.add_argument("--eff2-bad", action="store_true", help="두번째 효과가 원하지 않는 효과")
     parser.add_argument("--p-good", type=float, default=1.0,
-                        help="'효과 변경' 시 원하는 효과가 나올 확률 (예: 8종 중 3종이면 0.375)")
+                        help="해당 젬의 효과 4종 중 원하는 효과의 비율 (예: 2종이면 0.5)")
+    parser.add_argument("--hand", default=None,
+                        help="현재 표시된 서로 다른 가능성 4개 ID (쉼표 구분)")
     parser.add_argument("--bad-effect-scale", type=float, default=0.0,
                         help="weighted 목표에서 원하지 않는 효과 슬롯에 곱할 배율")
     parser.add_argument("--runs", type=int, default=20_000, help="sim 반복 횟수")
@@ -214,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         if gem.attempts_left == 0:
             print(f"  {_state_line(gem)}\n  가공이 끝난 상태입니다.")
             return 0
-        print_ranking(policy, gem)
+        hand = [resolve_option_id(x) for x in args.hand.split(",")] if args.hand else None
+        print_ranking(policy, gem, hand)
         print()
     elif args.command == "play":
         run_interactive(policy, gem)

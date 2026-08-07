@@ -91,7 +91,7 @@
 <body>
 <div class="wrap">
   <h1>젬 가공 계산기</h1>
-  <div class="sub">로스트아크 아크 그리드 · 매 턴 뜬 4개 중 무엇을 골라야 하는지 계산합니다</div>
+  <div class="sub">로스트아크 아크 그리드 · 가공, 다른 항목 보기, 가공 완료 중 최적 행동을 계산합니다</div>
 
   <div class="panel" id="setup">
     <h2>설정</h2>
@@ -122,8 +122,8 @@
       <label class="lbl">효과 종류</label>
       <label><input type="checkbox" id="useEffects"> 원하는 효과인지 따진다</label>
       <span id="pGoodWrap" class="hide">
-        변경 시 원하는 효과가 나올 확률
-        <input type="number" id="pGood" min="0" max="1" step="0.005" value="0.375">
+        전체 4종 중 원하는 효과의 비율
+        <select id="pGood"><option value="0">0/4</option><option value="0.25">1/4</option><option value="0.5" selected>2/4</option><option value="0.75">3/4</option><option value="1">4/4</option></select>
       </span>
     </div>
     <div class="row">
@@ -155,7 +155,7 @@
   </div>
 
   <div class="panel hide" id="choices">
-    <h2>선택지 순위 — 뜬 4개 중 가장 위에 있는 것을 고르세요</h2>
+    <h2>인게임에 표시된 서로 다른 가능성 4개를 선택하세요</h2>
     <div id="askBox" class="ask hide"></div>
     <ol class="opts" id="optList"></ol>
     <div id="rerollBox"></div>
@@ -167,7 +167,8 @@
     확률·횟수는 로스트아크
     <a href="https://m-lostark.game.onstove.com/Probability/%EC%A0%AC%20%EA%B0%80%EA%B3%B5,%20%EC%A0%AC%20%EC%9C%B5%ED%95%A9" target="_blank" rel="noopener">공식 확률 공개</a>와
     <a href="https://m-lostark.game.onstove.com/GameGuide/Pages/%EC%95%84%ED%81%AC%20%EA%B7%B8%EB%A6%AC%EB%93%9C" target="_blank" rel="noopener">공식 게임 가이드</a>에서 가져왔습니다 (확률 합계 100.0000%).
-    4개 선택지는 각 자리가 독립적으로 뽑힌다고 가정합니다.
+    같은 차수에는 동일한 가능성이 중복되지 않으며, 가공 시 네 가능성 중 하나가 각 25%로 무작위 적용됩니다.
+    사전 기대치는 결정적 비복원 표본으로 근사하며, 입력한 실제 네 가능성의 행동 비교는 정확합니다.
     계산은 전부 브라우저 안에서 이뤄지며 서버로 아무것도 보내지 않습니다.
   </footer>
 </div>
@@ -176,13 +177,14 @@
 // ==GEMCRAFT-ENGINE-START==
 // 이 블록은 Python 패키지 gemcraft 의 rules.py / state.py / objectives.py /
 // solver.py 를 그대로 옮긴 것이다. tests/test_web_parity.py 가 node 로 이
-// 블록을 실행해 Python 이 계산한 값과 1e-9 이내로 일치하는지 검사한다.
+// 블록을 실행해 Python 결과와 일치하는지 검사한다.
 // 규칙을 고칠 때는 반드시 Python 쪽과 함께 고쳐야 한다.
 
 const WILL = 0, POINT = 1, EFF1 = 2, EFF2 = 3;
 
 const RULES = {
   handSize: 4,
+  handSamples: 24,
   minLevel: 1,
   maxLevel: 5,
   costMin: -1,
@@ -307,7 +309,21 @@ const TABLES = (() => {
     if (kind === "reroll") gained[o] = param;
   }
 
-  return { level, good, cost, valid, prob, gained,
+  const validLast = valid.slice();
+  for (const id of ["cost+", "cost-", "reroll+1", "reroll+2"]) {
+    const o = OPTION_INDEX[id];
+    for (let s = 0; s < N_ATTR; s++) validLast[s * N_OPT + o] = 0;
+  }
+  const probLast = new Float64Array(N_ATTR * N_OPT);
+  for (let s = 0; s < N_ATTR; s++) {
+    let total = 0;
+    for (let o = 0; o < N_OPT; o++) if (validLast[s * N_OPT + o]) total += RULES.options[o][2];
+    for (let o = 0; o < N_OPT; o++) if (validLast[s * N_OPT + o]) {
+      probLast[s * N_OPT + o] = RULES.options[o][2] / total;
+    }
+  }
+
+  return { level, good, cost, valid, prob, validLast, probLast, gained,
            validStart, validList: Int32Array.from(validBuf) };
 })();
 
@@ -335,7 +351,7 @@ function buildTransitions(pGood) {
         const gb = g.slice(); gb[slot] = 0;
         succA[at] = encode(lv[0], lv[1], lv[2], lv[3], gg[0], gg[1], c);
         succB[at] = encode(lv[0], lv[1], lv[2], lv[3], gb[0], gb[1], c);
-        mixA[at] = pGood;
+        mixA[at] = Math.max(0, Math.min(1, (4 * pGood - g[0] - g[1]) / 2));
       } else if (kind === "cost") {
         const nc = Math.min(RULES.costMax, Math.max(RULES.costMin, c + param));
         succA[at] = succB[at] = encode(lv[0], lv[1], lv[2], lv[3], g[0], g[1], nc);
@@ -434,17 +450,18 @@ class Policy {
     const terminal = this.objective.terminalValues();
     for (let r = 0; r <= this.maxRerolls; r++) this.values.set(terminal, this._layer(0, r));
 
-    const { prob, gained, validStart, validList } = TABLES;
+    const { gained } = TABLES;
     const { succA, succB, mixA, values } = this;
-    const H = RULES.handSize;
     const q = new Float64Array(N_OPT);
-    const order = new Int32Array(N_OPT);
     const prevOff = new Int32Array(N_OPT);
     const totalLayers = this.attempts * this.rStride;
     let doneLayers = 0;
 
     for (let n = 1; n <= this.attempts; n++) {
       const canReroll = this.attempts - n >= RULES.rerollAvailableFromTurn;
+      const canComplete = this.attempts - n >= 1;
+      const hands = sampleHands(n);
+      const valid = n === 1 ? TABLES.validLast : TABLES.valid;
       for (let r = 0; r <= this.maxRerolls; r++) {
         for (let o = 0; o < N_OPT; o++) {
           prevOff[o] = this._layer(n - 1, Math.min(r + gained[o], this.maxRerolls));
@@ -454,37 +471,24 @@ class Policy {
 
         for (let s = 0; s < N_ATTR; s++) {
           const base = s * N_OPT;
-          const lo = validStart[s], hi = validStart[s + 1];
-          const m = hi - lo;
-          for (let i = 0; i < m; i++) {
-            const o = validList[lo + i];
+          for (let o = 0; o < N_OPT; o++) {
+            if (!valid[base + o]) continue;
             const at = base + o;
             const mix = mixA[at];
             q[o] = mix === 1
               ? values[prevOff[o] + succA[at]]
               : mix * values[prevOff[o] + succA[at]] + (1 - mix) * values[prevOff[o] + succB[at]];
-            order[i] = o;
-          }
-          // 가치 내림차순 정렬 (원소가 20여 개라 삽입 정렬이 가장 빠르다)
-          for (let i = 1; i < m; i++) {
-            const oi = order[i], qi = q[oi];
-            let j = i - 1;
-            while (j >= 0 && q[order[j]] < qi) { order[j + 1] = order[j]; j--; }
-            order[j + 1] = oi;
           }
           const floor = floorOff >= 0 ? values[floorOff + s] : -Infinity;
-          let acc = 0, expected = 0;
-          for (let i = 0; i < m; i++) {
-            const o = order[i];
-            const before = 1 - acc;
-            acc += prob[base + o];
-            const after = 1 - acc;
-            let w = before * before * before * before - after * after * after * after;
-            if (w <= 0) continue;
-            const value = q[o] > floor ? q[o] : floor;
-            expected += value * w;
+          const complete = canComplete ? terminal[s] : -Infinity;
+          let expected = 0, hp = s * RULES.handSamples * RULES.handSize;
+          for (let k = 0; k < RULES.handSamples; k++) {
+            let process = 0;
+            for (let d = 0; d < RULES.handSize; d++) process += q[hands[hp++]];
+            process /= RULES.handSize;
+            expected += Math.max(process, floor, complete);
           }
-          values[out + s] = expected;
+          values[out + s] = expected / RULES.handSamples;
         }
         doneLayers++;
         yield doneLayers / totalLayers;
@@ -534,10 +538,12 @@ class Policy {
     if (gem.attemptsLeft === 0) throw new Error("남은 가공 시도 횟수가 0 입니다.");
     const idx = this.index(gem);
     const q = this._qRow(idx, gem.attemptsLeft, gem.rerollsLeft);
+    const valid = gem.attemptsLeft === 1 ? TABLES.validLast : TABLES.valid;
+    const prob = gem.attemptsLeft === 1 ? TABLES.probLast : TABLES.prob;
     const rows = RULES.options.map(([id, label], o) => ({
       id, label, value: q[o],
-      available: !!TABLES.valid[idx * N_OPT + o],
-      appearProb: TABLES.prob[idx * N_OPT + o],
+      available: !!valid[idx * N_OPT + o],
+      appearProb: prob[idx * N_OPT + o],
     }));
     rows.sort((a, b) => (a.available !== b.available)
       ? (a.available ? -1 : 1) : b.value - a.value);
@@ -551,6 +557,53 @@ class Policy {
     if (gem.rerollsLeft < 1 || turn < RULES.rerollAvailableFromTurn) return null;
     return this.values[this._layer(gem.attemptsLeft, gem.rerollsLeft - 1) + this.index(gem)];
   }
+
+  recommendHand(gem, hand) {
+    if (hand.length !== RULES.handSize || new Set(hand).size !== RULES.handSize) {
+      throw new Error("서로 다른 가능성 4개를 입력해야 합니다.");
+    }
+    const rows = Object.fromEntries(this.optionValues(gem).map((x) => [x.id, x]));
+    if (hand.some((id) => !rows[id] || !rows[id].available)) throw new Error("등장 불가능한 가능성이 포함됐습니다.");
+    const processValue = hand.reduce((a, id) => a + rows[id].value, 0) / RULES.handSize;
+    const rerollValue = this.rerollValue(gem);
+    const turn = this.attempts - gem.attemptsLeft;
+    const completeValue = turn >= 1 ? this.objective.terminalValues()[this.index(gem)] : null;
+    const candidates = [["process", processValue]];
+    if (rerollValue !== null) candidates.push(["reroll", rerollValue]);
+    if (completeValue !== null) candidates.push(["complete", completeValue]);
+    candidates.sort((a, b) => b[1] - a[1]);
+    return { action: candidates[0][0], processValue, rerollValue, completeValue };
+  }
+}
+
+const HAND_CACHE = new Map();
+function sampleHands(attemptsLeft) {
+  const key = attemptsLeft === 1 ? 1 : 2;
+  if (HAND_CACHE.has(key)) return HAND_CACHE.get(key);
+  const valid = key === 1 ? TABLES.validLast : TABLES.valid;
+  const out = new Int16Array(N_ATTR * RULES.handSamples * RULES.handSize);
+  let hp = 0;
+  for (let s = 0; s < N_ATTR; s++) {
+    const baseChoices = [], baseWeights = [];
+    for (let o = 0; o < N_OPT; o++) if (valid[s * N_OPT + o]) {
+      baseChoices.push(o); baseWeights.push(RULES.options[o][2]);
+    }
+    for (let k = 0; k < RULES.handSamples; k++) {
+      const choices = baseChoices.slice(), weights = baseWeights.slice();
+      let seed = (0x9e3779b9 ^ Math.imul(s, 0x85ebca6b) ^ Math.imul(k, 0xc2b2ae35)
+                  ^ Math.imul(key, 0x27d4eb2f)) >>> 0;
+      for (let d = 0; d < RULES.handSize; d++) {
+        seed = (Math.imul(1664525, seed) + 1013904223) >>> 0;
+        let total = 0; for (const w of weights) total += w;
+        const target = (seed / 4294967296) * total;
+        let acc = 0, pick = weights.length - 1;
+        for (let j = 0; j < weights.length; j++) { acc += weights[j]; if (target < acc) { pick = j; break; } }
+        out[hp++] = choices.splice(pick, 1)[0]; weights.splice(pick, 1);
+      }
+    }
+  }
+  HAND_CACHE.set(key, out);
+  return out;
 }
 
 /** 선택지를 적용한 다음 상태. 효과 변경 결과(newGood)는 호출자가 알려 준다. */
@@ -580,7 +633,7 @@ function initialState(grade) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { RULES, N_ATTR, N_OPT, encode, decode, gemGrade, parseGoal,
-                     Policy, applyOption, initialState, OPTION_INDEX };
+                     Policy, applyOption, initialState, OPTION_INDEX, sampleHands };
 }
 // ==GEMCRAFT-ENGINE-END==
 </script>
@@ -588,7 +641,8 @@ if (typeof module !== "undefined" && module.exports) {
 <script>
 // --- UI ----------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
-const state = { grade: "영웅", policy: null, gem: null, history: [], pending: null };
+const state = { grade: "영웅", policy: null, gem: null, history: [], pending: null,
+                selected: [], awaitingResult: false };
 
 // 설정 위젯 채우기
 $("grade").innerHTML = Object.keys(RULES.grades).map((g) => {
@@ -675,6 +729,8 @@ $("start").onclick = () => {
     state.policy = policy;
     state.gem = gem;
     state.history = [];
+    state.selected = [];
+    state.awaitingResult = false;
     render();
   };
   setTimeout(pump, 0);
@@ -684,12 +740,16 @@ $("undo").onclick = () => {
   if (!state.history.length) return;
   state.gem = state.history.pop();
   state.pending = null;
+  state.selected = [];
+  state.awaitingResult = false;
   render();
 };
 $("restart").onclick = () => {
   state.gem = currentGem();
   state.history = [];
   state.pending = null;
+  state.selected = [];
+  state.awaitingResult = false;
   render();
 };
 
@@ -746,7 +806,7 @@ function renderChoices() {
       const optionId = state.pending;
       state.pending = null;
       if (answer === "cancel") return renderChoices();
-      commit(optionId, answer === "1");
+      commitApplied(optionId, answer === "1");
     };
     $("optList").innerHTML = "";
     $("rerollBox").innerHTML = "";
@@ -755,51 +815,68 @@ function renderChoices() {
   $("askBox").classList.add("hide");
   $("askBox").innerHTML = "";
 
-  const reroll = policy.rerollValue(gem);
   const rows = policy.optionValues(gem).filter((row) => row.available);
-  let html = "";
-  let dividerDrawn = false;
-  rows.forEach((row, i) => {
-    if (reroll !== null && !dividerDrawn && row.value < reroll) {
-      html += `<div class="divider">여기부터는 리롤(${fmt(reroll)})이 더 낫습니다</div>`;
-      dividerDrawn = true;
-    }
-    html += `<li><button class="opt${i === 0 ? " top" : ""}" data-opt="${row.id}">` +
-      `<span class="rank">${i + 1}</span><span>${row.label}</span>` +
-      `<span class="appear">등장 ${(row.appearProb * 100).toFixed(2)}%</span>` +
-      `<span class="val">${fmt(row.value)}</span></button></li>`;
-  });
+  const shown = state.awaitingResult ? rows.filter((r) => state.selected.includes(r.id)) : rows;
+  let html = shown.map((row) => {
+    const selected = state.selected.includes(row.id);
+    return `<li><button class="opt${selected ? " top" : ""}" data-opt="${row.id}">` +
+      `<span class="rank">${selected ? "✓" : ""}</span><span>${row.label}</span>` +
+      `<span class="appear">기준 등장률 ${(row.appearProb * 100).toFixed(2)}%</span>` +
+      `<span class="val">적용 시 ${fmt(row.value)}</span></button></li>`;
+  }).join("");
   $("optList").innerHTML = html;
   $("optList").onclick = (e) => {
     const btn = e.target.closest("button[data-opt]");
     if (!btn) return;
     const optionId = btn.dataset.opt;
+    if (!state.awaitingResult) {
+      const pos = state.selected.indexOf(optionId);
+      if (pos >= 0) state.selected.splice(pos, 1);
+      else if (state.selected.length < RULES.handSize) state.selected.push(optionId);
+      return renderChoices();
+    }
     if (RULES.options[OPTION_INDEX[optionId]][3] === "change") {
       state.pending = optionId;
       return renderChoices();
     }
-    commit(optionId, null);
+    commitApplied(optionId, null);
   };
 
-  if (reroll !== null) {
-    $("rerollBox").innerHTML =
-      `<div class="row" style="margin-top:12px"><button id="doReroll">다른 항목 보기 사용 ` +
-      `(남은 ${gem.rerollsLeft}회)</button><span class="hint">뜬 4개의 최고 순위가 위 ` +
-      `기준선보다 아래면 리롤하세요 — 가치 ${fmt(reroll)}</span></div>`;
-    $("doReroll").onclick = () => {
-      state.history.push(Object.assign({}, gem));
-      state.gem = Object.assign({}, gem, { rerollsLeft: gem.rerollsLeft - 1 });
-      render();
-    };
-  } else {
-    $("rerollBox").innerHTML = gem.rerollsLeft > 0
-      ? `<div class="hint">다른 항목 보기는 가공을 1회 진행한 뒤부터 쓸 수 있습니다.</div>` : "";
+  if (state.awaitingResult) {
+    $("rerollBox").innerHTML = `<div class="hint">가공 결과로 실제 적용된 가능성을 위 4개 중에서 누르세요.</div>`;
+    return;
   }
+  if (state.selected.length < RULES.handSize) {
+    $("rerollBox").innerHTML = `<div class="hint">현재 선택 ${state.selected.length}/4 · 같은 가능성은 한 번만 선택할 수 있습니다.</div>`;
+    return;
+  }
+  const decision = policy.recommendHand(gem, state.selected);
+  const names = { process: "가공하기", reroll: "다른 항목 보기", complete: "가공 완료" };
+  const valueRows = [`가공 ${fmt(decision.processValue)}`];
+  if (decision.rerollValue !== null) valueRows.push(`다른 항목 보기 ${fmt(decision.rerollValue)}`);
+  if (decision.completeValue !== null) valueRows.push(`가공 완료 ${fmt(decision.completeValue)}`);
+  $("rerollBox").innerHTML = `<div class="done"><b>추천: ${names[decision.action]}</b><div class="hint">${valueRows.join(" · ")}</div>` +
+    `<div class="row" style="justify-content:center;margin-top:10px"><button id="doProcess">가공하기</button>` +
+    (decision.rerollValue !== null ? `<button id="doReroll">다른 항목 보기 (${gem.rerollsLeft})</button>` : "") +
+    (decision.completeValue !== null ? `<button id="doComplete">가공 완료</button>` : "") + `</div></div>`;
+  $("doProcess").onclick = () => { state.awaitingResult = true; renderChoices(); };
+  if ($("doReroll")) $("doReroll").onclick = () => {
+    state.history.push(Object.assign({}, gem));
+    state.gem = Object.assign({}, gem, { rerollsLeft: gem.rerollsLeft - 1 });
+    state.selected = []; state.awaitingResult = false; render();
+  };
+  if ($("doComplete")) $("doComplete").onclick = () => {
+    state.history.push(Object.assign({}, gem));
+    state.gem = Object.assign({}, gem, { attemptsLeft: 0 });
+    state.selected = []; state.awaitingResult = false; render();
+  };
 }
 
-function commit(optionId, newGood) {
+function commitApplied(optionId, newGood) {
   state.history.push(Object.assign({}, state.gem));
   state.gem = applyOption(state.gem, optionId, newGood, state.policy.maxRerolls);
+  state.selected = [];
+  state.awaitingResult = false;
   render();
 }
 </script>
