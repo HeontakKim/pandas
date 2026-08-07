@@ -54,14 +54,16 @@ function chooseFour() {
 
   chooseFour();
   check("서로 다른 4개 선택", optionButtons().filter((b) => b.classList.contains("top")).length === 4);
-  check("추천 표시", $("rerollBox").textContent.includes("추천:"), $("rerollBox").textContent);
+  check("추천 표시", $("rerollBox").textContent.includes("추천"), $("rerollBox").textContent);
   check("첫 턴 리롤 버튼 없음", $("doReroll") === null);
   check("첫 턴 완료 버튼 없음", $("doComplete") === null);
   check("가공 버튼 있음", $("doProcess") !== null);
   $("doProcess").click();
-  check("결과 입력 안내", $("rerollBox").textContent.includes("실제 적용"));
-  check("입력한 네 가능성만 표시", optionButtons().length === 4, optionButtons().length);
-  optionButtons()[0].click();
+  check("결과 입력 안내", $("pickerTitle").textContent.includes("실제로 적용"));
+  const resultCards = [...$("handSlots").querySelectorAll("button[data-hand-opt]")];
+  check("입력한 네 가능성만 결과 카드로 표시", resultCards.length === 4, resultCards.length);
+  check("결과 입력 중 선택기 숨김", optionButtons().length === 0, optionButtons().length);
+  resultCards[0].click();
   await sleep(0);
   if (visible("askBox")) { $("askBox").querySelector('[data-good="1"]').click(); await sleep(0); }
   cells = stateCells();
@@ -69,7 +71,7 @@ function chooseFour() {
   check("다음 손패 선택 초기화", $("rerollBox").textContent.includes("0/4"));
 
   chooseFour();
-  check("2턴 추천 표시", $("rerollBox").textContent.includes("추천:"));
+  check("2턴 추천 표시", $("rerollBox").textContent.includes("추천"));
   check("2턴 리롤 버튼 있음", $("doReroll") !== null);
   check("2턴 완료 버튼 있음", $("doComplete") !== null);
   const before = stateCells()["남은 리롤"];

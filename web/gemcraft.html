@@ -86,12 +86,109 @@
   footer { color: var(--dim); font-size: 12.5px; margin-top: 26px; }
   footer a { color: var(--accent); }
   code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+
+  /* 인게임 젬 가공 화면의 정보 구조를 재해석한 계산기 전용 UI */
+  body {
+    background:
+      radial-gradient(circle at 50% -10%, rgba(54, 103, 153, .28), transparent 34rem),
+      linear-gradient(180deg, #080d15 0%, #101722 55%, #090d14 100%);
+    min-height: 100vh;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .18;
+    background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: radial-gradient(circle at 50% 30%, black, transparent 75%);
+  }
+  .wrap { max-width: 1080px; padding-top: 28px; position: relative; }
+  .brand { text-align: center; margin-bottom: 22px; }
+  .brand .eyebrow { color: #88bfe9; font-size: 11px; letter-spacing: .24em; text-transform: uppercase; }
+  .brand h1 { font-family: Georgia, "Noto Serif KR", serif; font-size: clamp(25px, 4vw, 38px); letter-spacing: .08em; margin: 4px 0; color: #eef7ff; text-shadow: 0 0 24px rgba(108,184,255,.3); }
+  .brand .sub { margin: 0; }
+  .panel { background: linear-gradient(145deg, rgba(24,34,49,.96), rgba(12,18,28,.96)); border-color: #34465d; box-shadow: 0 18px 45px rgba(0,0,0,.24), inset 0 1px rgba(255,255,255,.025); }
+  .panel h2 { color: #9db1c7; letter-spacing: .12em; }
+  #setup { border-top: 2px solid #547da0; }
+
+  .gem-dashboard { display: block; }
+  .gem-stage { position: relative; min-height: 330px; display: grid; place-items: center; overflow: hidden; border-radius: 12px; background: radial-gradient(circle, rgba(51,91,126,.22), transparent 56%); }
+  .gem-stage::before, .gem-stage::after { content: ""; position: absolute; border: 1px solid rgba(107,157,199,.17); border-radius: 50%; }
+  .gem-stage::before { width: 290px; height: 290px; box-shadow: 0 0 45px rgba(70,144,205,.1), inset 0 0 45px rgba(70,144,205,.08); }
+  .gem-stage::after { width: 220px; height: 220px; border-style: dashed; animation: orbit 40s linear infinite; }
+  @keyframes orbit { to { transform: rotate(360deg); } }
+  .gem-core { position: absolute; z-index: 2; width: 82px; height: 82px; transform: rotate(45deg); border: 2px solid #75b6e3; background: radial-gradient(circle at 35% 30%, #3bb8d6, #16406a 55%, #0b1830); box-shadow: 0 0 0 7px #101b2a, 0 0 0 9px #496d8d, 0 0 35px rgba(69,180,233,.45); }
+  .gem-core::after { content: "◆"; display: grid; place-items: center; width: 100%; height: 100%; transform: rotate(-45deg); color: #d8f6ff; font-size: 34px; text-shadow: 0 0 14px white; }
+  .stat-gem { position: absolute; z-index: 3; width: 106px; height: 106px; transform: rotate(45deg); border: 2px solid currentColor; background: #101722; box-shadow: 0 0 0 5px #0b111a, 0 0 22px color-mix(in srgb, currentColor 35%, transparent); display: grid; place-items: center; }
+  .stat-gem > div { transform: rotate(-45deg); text-align: center; width: 120px; line-height: 1.25; }
+  .stat-gem .sg-name { font-size: 12px; color: #e4edf5; }
+  .stat-gem .sg-value { font-size: 25px; font-weight: 800; color: currentColor; }
+  .stat-gem .sg-bad { font-size: 10px; color: #ef8d8d; }
+  .stat-will { color: #eb6c58; top: 30px; }
+  .stat-point { color: #efc356; bottom: 30px; }
+  .stat-eff1 { color: #77cf77; left: calc(50% - 185px); }
+  .stat-eff2 { color: #63aee9; right: calc(50% - 185px); }
+  .gem-meta { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 8px; margin-top: 10px; }
+  .gem-meta .cell { background: rgba(10,16,25,.75); border: 1px solid #2e4054; text-align: center; }
+
+  .hand-slots { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }
+  .hand-card { min-height: 118px; border: 1px solid #3a4d62; background: linear-gradient(160deg,#182536,#0e1622); border-radius: 8px; padding: 12px 9px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; position: relative; overflow: hidden; }
+  .hand-card::before { content: ""; position: absolute; inset: 0; opacity: .18; background: radial-gradient(circle at 50% 0, currentColor, transparent 62%); }
+  .hand-card .slot-no { position: absolute; top: 6px; left: 8px; color: #718398; font-size: 10px; }
+  .hand-card .hc-icon { width: 36px; height: 36px; transform: rotate(45deg); border: 1px solid currentColor; margin-bottom: 12px; background: rgba(0,0,0,.25); box-shadow: 0 0 14px color-mix(in srgb, currentColor 30%, transparent); }
+  .hand-card .hc-icon::after { content: "◆"; display: grid; place-items: center; height: 100%; transform: rotate(-45deg); font-size: 15px; }
+  .hand-card .hc-label { position: relative; font-size: 13px; line-height: 1.35; }
+  .hand-card.empty { color: #60758a; border-style: dashed; cursor: default; }
+  .hand-card.tone-will { color: #eb6c58; } .hand-card.tone-point { color: #efc356; }
+  .hand-card.tone-eff1 { color: #77cf77; } .hand-card.tone-eff2 { color: #63aee9; }
+  .hand-card.tone-other { color: #b99be8; }
+  .hand-card.result-pick { cursor: pointer; animation: resultPulse 1.8s ease-in-out infinite; }
+  @keyframes resultPulse { 50% { border-color: currentColor; transform: translateY(-2px); } }
+
+  .picker-title { display: flex; justify-content: space-between; align-items: center; color: #9db1c7; font-size: 12px; margin: 4px 0 8px; }
+  ol.opts { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px; max-height: 330px; overflow: auto; padding-right: 4px; }
+  ol.opts li { margin: 0; }
+  .opt { grid-template-columns: 24px 1fr auto; padding: 8px 10px; min-height: 48px; border-left: 3px solid #637489; }
+  .opt .appear { display: none; }
+  .opt .val { font-size: 11px; min-width: auto; color: #8798aa; }
+  .opt.tone-will { border-left-color:#eb6c58; } .opt.tone-point { border-left-color:#efc356; }
+  .opt.tone-eff1 { border-left-color:#77cf77; } .opt.tone-eff2 { border-left-color:#63aee9; }
+  .opt.tone-other { border-left-color:#b99be8; }
+  .opt.top { background: #25384a; box-shadow: inset 0 0 18px rgba(126,195,236,.08); }
+
+  .decision { border: 1px solid #405b72; background: rgba(7,12,19,.65); border-radius: 10px; padding: 14px; }
+  .decision-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+  .decision-head b { color:#f1d184; font-size:17px; }
+  .decision-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .decision-item { padding:10px; border:1px solid #2f4154; background:#111a27; border-radius:7px; }
+  .decision-item.best { border-color:#ddb85a; box-shadow:0 0 20px rgba(221,184,90,.12); }
+  .decision-item .di-name { color:#9cadbd; font-size:11px; }
+  .decision-item .di-value { font-weight:700; margin:3px 0 6px; }
+  .decision-item .meter { height:4px; background:#263545; border-radius:4px; overflow:hidden; }
+  .decision-item .meter > i { display:block; height:100%; background:linear-gradient(90deg,#4e91c4,#e1c167); }
+  .action-row { display:flex; gap:8px; justify-content:center; margin-top:12px; }
+  .action-row button.recommended { border-color:#e4c667; color:#f5dd91; box-shadow:0 0 16px rgba(228,198,103,.14); }
+
+  @media (max-width: 700px) {
+    .wrap { padding: 16px 10px 44px; }
+    .panel { padding: 12px; }
+    .gem-stage { min-height: 285px; transform: scale(.9); margin: -14px -20px; }
+    .stat-eff1 { left: calc(50% - 145px); } .stat-eff2 { right: calc(50% - 145px); }
+    .stat-gem { width: 90px; height: 90px; }
+    .hand-slots { grid-template-columns: repeat(2,1fr); }
+    .hand-card { min-height: 96px; }
+    ol.opts { grid-template-columns:1fr; max-height:300px; }
+    .decision-grid { grid-template-columns:1fr; }
+    .gem-meta { grid-template-columns:repeat(2,1fr); }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>젬 가공 계산기</h1>
-  <div class="sub">로스트아크 아크 그리드 · 가공, 다른 항목 보기, 가공 완료 중 최적 행동을 계산합니다</div>
+  <header class="brand">
+    <div class="eyebrow">Lost Ark · Ark Grid</div>
+    <h1>젬 가공 전략실</h1>
+    <div class="sub">현재 젬과 네 가지 가능성을 입력해 가장 유리한 행동을 찾습니다</div>
+  </header>
 
   <div class="panel" id="setup">
     <h2>설정</h2>
@@ -155,8 +252,10 @@
   </div>
 
   <div class="panel hide" id="choices">
-    <h2>인게임에 표시된 서로 다른 가능성 4개를 선택하세요</h2>
+    <h2>이번 차수의 가능성</h2>
+    <div id="handSlots" class="hand-slots"></div>
     <div id="askBox" class="ask hide"></div>
+    <div id="pickerTitle" class="picker-title"></div>
     <ol class="opts" id="optList"></ol>
     <div id="rerollBox"></div>
   </div>
@@ -765,15 +864,25 @@ function render() {
 
   const total = gem.will + gem.point + gem.eff1 + gem.eff2;
   const cells = [
+    ["레벨 총합", `${total} (${gemGrade(total)})`], ["남은 시도", gem.attemptsLeft],
+    ["남은 리롤", gem.rerollsLeft],
+    ["가공 비용", gem.cost === 0 ? "기본" : (gem.cost > 0 ? "+" : "") + gem.cost * 100 + "%"],
+    // UI 테스트와 접근성을 위해 네 옵션도 읽을 수 있는 셀로 유지한다.
     ["의지력 효율", gem.will], ["질서/혼돈 포인트", gem.point],
     ["첫번째 효과", gem.eff1 + (gem.eff1Good ? "" : " ✗")],
     ["두번째 효과", gem.eff2 + (gem.eff2Good ? "" : " ✗")],
-    ["레벨 총합", `${total} (${gemGrade(total)})`],
-    ["남은 시도", gem.attemptsLeft], ["남은 리롤", gem.rerollsLeft],
   ];
-  if (gem.cost !== 0) cells.push(["가공 비용", (gem.cost > 0 ? "+" : "") + gem.cost * 100 + "%"]);
-  $("stateGrid").innerHTML = cells.map(([k, v]) =>
-    `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  const statGem = (cls, name, value, good = true) =>
+    `<div class="stat-gem ${cls}"><div><div class="sg-name">${name}</div>` +
+    `<div class="sg-value">Lv. ${value}</div>${good ? "" : `<div class="sg-bad">원하지 않는 효과</div>`}</div></div>`;
+  $("stateGrid").innerHTML =
+    `<div class="gem-stage" aria-label="현재 젬 상태"><div class="gem-core"></div>` +
+    statGem("stat-will", "의지력 효율", gem.will) +
+    statGem("stat-point", "질서/혼돈 포인트", gem.point) +
+    statGem("stat-eff1", "첫번째 효과", gem.eff1, gem.eff1Good) +
+    statGem("stat-eff2", "두번째 효과", gem.eff2, gem.eff2Good) + `</div>` +
+    `<div class="gem-meta">${cells.map(([k, v], i) =>
+      `<div class="cell${i >= 4 ? " hide" : ""}"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}</div>`;
 
   if (gem.attemptsLeft === 0) {
     $("choices").classList.add("hide");
@@ -792,6 +901,32 @@ function render() {
 function renderChoices() {
   const { policy, gem } = state;
 
+  const tone = (id) => id.startsWith("will") ? "will" : id.startsWith("point") ? "point" :
+    id.startsWith("eff1") || id === "chg1" ? "eff1" :
+    id.startsWith("eff2") || id === "chg2" ? "eff2" : "other";
+  const slotHtml = [0, 1, 2, 3].map((i) => {
+    const id = state.selected[i];
+    if (!id) return `<div class="hand-card empty"><span class="slot-no">0${i + 1}</span>` +
+      `<div class="hc-icon"></div><div class="hc-label">가능성 선택</div></div>`;
+    const label = RULES.options[OPTION_INDEX[id]][1];
+    return `<button class="hand-card tone-${tone(id)}${state.awaitingResult ? " result-pick" : ""}" data-hand-opt="${id}">` +
+      `<span class="slot-no">0${i + 1}</span><div class="hc-icon"></div><div class="hc-label">${label}</div></button>`;
+  }).join("");
+  $("handSlots").innerHTML = slotHtml;
+  $("handSlots").onclick = (e) => {
+    const btn = e.target.closest("button[data-hand-opt]");
+    if (!btn) return;
+    const id = btn.dataset.handOpt;
+    if (state.awaitingResult) {
+      if (RULES.options[OPTION_INDEX[id]][3] === "change") {
+        state.pending = id; return renderChoices();
+      }
+      return commitApplied(id, null);
+    }
+    state.selected.splice(state.selected.indexOf(id), 1);
+    renderChoices();
+  };
+
   if (state.pending) {
     $("askBox").classList.remove("hide");
     $("askBox").innerHTML =
@@ -809,6 +944,7 @@ function renderChoices() {
       commitApplied(optionId, answer === "1");
     };
     $("optList").innerHTML = "";
+    $("pickerTitle").innerHTML = "";
     $("rerollBox").innerHTML = "";
     return;
   }
@@ -816,10 +952,10 @@ function renderChoices() {
   $("askBox").innerHTML = "";
 
   const rows = policy.optionValues(gem).filter((row) => row.available);
-  const shown = state.awaitingResult ? rows.filter((r) => state.selected.includes(r.id)) : rows;
+  const shown = state.awaitingResult ? [] : rows;
   let html = shown.map((row) => {
     const selected = state.selected.includes(row.id);
-    return `<li><button class="opt${selected ? " top" : ""}" data-opt="${row.id}">` +
+    return `<li><button class="opt tone-${tone(row.id)}${selected ? " top" : ""}" data-opt="${row.id}">` +
       `<span class="rank">${selected ? "✓" : ""}</span><span>${row.label}</span>` +
       `<span class="appear">기준 등장률 ${(row.appearProb * 100).toFixed(2)}%</span>` +
       `<span class="val">적용 시 ${fmt(row.value)}</span></button></li>`;
@@ -843,22 +979,32 @@ function renderChoices() {
   };
 
   if (state.awaitingResult) {
-    $("rerollBox").innerHTML = `<div class="hint">가공 결과로 실제 적용된 가능성을 위 4개 중에서 누르세요.</div>`;
+    $("pickerTitle").innerHTML = `<b>가공 결과 입력</b><span>실제로 적용된 카드를 누르세요</span>`;
+    $("rerollBox").innerHTML = `<div class="decision"><div class="decision-head"><b>어떤 가능성이 적용됐나요?</b>` +
+      `<span class="hint">인게임에서 빛난 카드와 같은 카드를 선택하세요</span></div></div>`;
     return;
   }
+  $("pickerTitle").innerHTML = `<b>가능성 선택기</b><span>인게임에 표시된 항목을 차례로 4개 고르세요</span>`;
   if (state.selected.length < RULES.handSize) {
     $("rerollBox").innerHTML = `<div class="hint">현재 선택 ${state.selected.length}/4 · 같은 가능성은 한 번만 선택할 수 있습니다.</div>`;
     return;
   }
   const decision = policy.recommendHand(gem, state.selected);
   const names = { process: "가공하기", reroll: "다른 항목 보기", complete: "가공 완료" };
-  const valueRows = [`가공 ${fmt(decision.processValue)}`];
-  if (decision.rerollValue !== null) valueRows.push(`다른 항목 보기 ${fmt(decision.rerollValue)}`);
-  if (decision.completeValue !== null) valueRows.push(`가공 완료 ${fmt(decision.completeValue)}`);
-  $("rerollBox").innerHTML = `<div class="done"><b>추천: ${names[decision.action]}</b><div class="hint">${valueRows.join(" · ")}</div>` +
-    `<div class="row" style="justify-content:center;margin-top:10px"><button id="doProcess">가공하기</button>` +
-    (decision.rerollValue !== null ? `<button id="doReroll">다른 항목 보기 (${gem.rerollsLeft})</button>` : "") +
-    (decision.completeValue !== null ? `<button id="doComplete">가공 완료</button>` : "") + `</div></div>`;
+  const choices = [
+    ["process", "가공하기", decision.processValue],
+    ["reroll", "다른 항목 보기", decision.rerollValue],
+    ["complete", "가공 완료", decision.completeValue],
+  ].filter((x) => x[2] !== null);
+  const maxValue = Math.max(...choices.map((x) => x[2]), policy.objective.isProbability ? 1 : .001);
+  const comparisons = choices.map(([key, name, value]) =>
+    `<div class="decision-item${decision.action === key ? " best" : ""}"><div class="di-name">${name}</div>` +
+    `<div class="di-value">${fmt(value)}</div><div class="meter"><i style="width:${Math.max(3, value / maxValue * 100).toFixed(1)}%"></i></div></div>`).join("");
+  $("rerollBox").innerHTML = `<div class="decision"><div class="decision-head"><span>행동별 목표 기대치</span>` +
+    `<b>추천 · ${names[decision.action]}</b></div><div class="decision-grid">${comparisons}</div>` +
+    `<div class="action-row"><button id="doProcess" class="${decision.action === "process" ? "recommended" : ""}">가공하기</button>` +
+    (decision.rerollValue !== null ? `<button id="doReroll" class="${decision.action === "reroll" ? "recommended" : ""}">다른 항목 보기 (${gem.rerollsLeft})</button>` : "") +
+    (decision.completeValue !== null ? `<button id="doComplete" class="${decision.action === "complete" ? "recommended" : ""}">가공 완료</button>` : "") + `</div></div>`;
   $("doProcess").onclick = () => { state.awaitingResult = true; renderChoices(); };
   if ($("doReroll")) $("doReroll").onclick = () => {
     state.history.push(Object.assign({}, gem));
