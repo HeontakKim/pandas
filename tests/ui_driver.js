@@ -28,20 +28,31 @@ function stateCells() {
 }
 function optionButtons() { return [...$("optList").querySelectorAll("button[data-opt]")]; }
 function chooseFour() {
-  for (let i = 0; i < 4; i++) optionButtons().find((b) => !b.classList.contains("top")).click();
+  for (let i = 0; i < 4; i++) optionButtons().find((b) => !b.classList.contains("active")).click();
 }
 
 (async () => {
   await waitFor(() => $("grade").children.length === 3, "초기 렌더");
   check("등급 버튼 3개", $("grade").children.length === 3);
-  check("세션은 처음에 숨김", !visible("session"));
+  const t0 = window.performance.now();
+  await waitFor(() => visible("session") && !$("start").disabled, "초기 자동 계산");
+  const solveMs = window.performance.now() - t0;
+  check("처음부터 젬 UI 표시", visible("session") && visible("choices"));
+  check("10초 안에 자동 계산", solveMs < 10000, solveMs);
+  check("초기 등급은 영웅", stateCells()["남은 시도"] === "9");
+
   [...$("grade").children].find((b) => b.dataset.grade === "희귀").click();
   check("희귀 선택 반영", $("grade").children[1].getAttribute("aria-pressed") === "true");
+  await waitFor(() => stateCells()["남은 시도"] === "7" && !$("start").disabled, "등급 자동 반영");
+  check("등급 변경 즉시 시도 반영", stateCells()["남은 시도"] === "7");
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  await sleep(0);
+  check("Ctrl+Z로 이전 등급 복원", stateCells()["남은 시도"] === "9");
+  [...$("grade").children].find((b) => b.dataset.grade === "희귀").click();
+  await waitFor(() => stateCells()["남은 시도"] === "7" && !$("start").disabled, "희귀 재선택");
+
   $("goal").value = "target=4,4,0,0"; $("goal").dispatchEvent(new window.Event("change"));
-  const t0 = window.performance.now(); $("start").click();
-  await waitFor(() => visible("session"), "계산 완료");
-  const solveMs = window.performance.now() - t0;
-  check("10초 안에 계산", solveMs < 10000, solveMs);
+  await waitFor(() => !$("start").disabled, "목표 자동 계산");
   check("진행 바 숨김", !visible("progress"));
   check("시작 버튼 활성", !$("start").disabled);
   let cells = stateCells();
@@ -49,21 +60,34 @@ function chooseFour() {
   check("희귀 시도 7", cells["남은 시도"] === "7", cells["남은 시도"]);
   check("희귀 리롤 1", cells["남은 리롤"] === "1", cells["남은 리롤"]);
   check("기대치 퍼센트", /^\d+\.\d\d%$/.test($("value").textContent), $("value").textContent);
-  check("가능성 목록 표시", optionButtons().length > 10, optionButtons().length);
+  check("옵션 종류 4개로 통합", $("optList").querySelectorAll("button[data-attr]").length === 4);
+  check("증감량 별도 선택", optionButtons().some((b) => b.textContent.includes("+4 증가")));
   check("초기 선택 0/4", $("rerollBox").textContent.includes("0/4"), $("rerollBox").textContent);
 
+  const willDiamond = $("stateGrid").querySelector('[data-edit-stat="will"]');
+  willDiamond.click();
+  check("마름모 클릭 시 상태 편집기", visible("stateEditor"));
+  $("stateEditor").querySelector('[data-level="2"]').click(); await sleep(0);
+  check("마름모에서 레벨 변경", stateCells()["의지력 효율"] === "2");
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  check("상태 편집도 Ctrl+Z 복원", stateCells()["의지력 효율"] === "1");
+  $("stateGrid").querySelector('[data-edit-stat="eff1"]').click();
+  $("effectName").value = "공격력";
+  $("effectName").dispatchEvent(new window.Event("change")); await sleep(0);
+  check("효과 마름모에서 효과명 변경", $("stateGrid").querySelector('[data-edit-stat="eff1"]').textContent.includes("공격력"));
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+
   chooseFour();
-  check("서로 다른 4개 선택", optionButtons().filter((b) => b.classList.contains("top")).length === 4);
+  check("서로 다른 4개 선택", $("handSlots").querySelectorAll("button[data-hand-opt]").length === 4);
   check("추천 표시", $("rerollBox").textContent.includes("추천"), $("rerollBox").textContent);
   check("첫 턴 리롤 버튼 없음", $("doReroll") === null);
   check("첫 턴 완료 버튼 없음", $("doComplete") === null);
-  check("가공 버튼 있음", $("doProcess") !== null);
-  $("doProcess").click();
-  check("결과 입력 안내", $("pickerTitle").textContent.includes("실제로 적용"));
+  check("중앙 가공 버튼은 적용 카드 전 비활성", $("applyProcess").disabled);
   const resultCards = [...$("handSlots").querySelectorAll("button[data-hand-opt]")];
-  check("입력한 네 가능성만 결과 카드로 표시", resultCards.length === 4, resultCards.length);
-  check("결과 입력 중 선택기 숨김", optionButtons().length === 0, optionButtons().length);
-  resultCards[0].click();
+  resultCards[0].click(); await sleep(0);
+  check("실제 적용 카드 선택", resultCards[0].dataset.handOpt && !$("applyProcess").disabled);
+  check("가공 버튼에 적용 효과 표시", $("applyProcess").textContent.includes("증가"));
+  $("applyProcess").click();
   await sleep(0);
   if (visible("askBox")) { $("askBox").querySelector('[data-good="1"]').click(); await sleep(0); }
   cells = stateCells();
@@ -81,7 +105,6 @@ function chooseFour() {
   $("undo").click(); await sleep(0);
   check("되돌리기 리롤 복구", stateCells()["남은 리롤"] === before);
 
-  chooseFour();
   $("doComplete").click(); await sleep(0);
   check("중도 완료 패널", visible("finished"));
   check("중도 완료 시도 0", stateCells()["남은 시도"] === "0");

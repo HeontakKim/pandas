@@ -142,6 +142,7 @@
   .hand-card.tone-eff1 { color: #77cf77; } .hand-card.tone-eff2 { color: #63aee9; }
   .hand-card.tone-other { color: #b99be8; }
   .hand-card.result-pick { cursor: pointer; animation: resultPulse 1.8s ease-in-out infinite; }
+  .hand-card.applied { outline:2px solid #ffe18a; box-shadow:0 0 24px rgba(255,218,110,.28); transform:translateY(-3px); }
   @keyframes resultPulse { 50% { border-color: currentColor; transform: translateY(-2px); } }
 
   .picker-title { display: flex; justify-content: space-between; align-items: center; color: #9db1c7; font-size: 12px; margin: 4px 0 8px; }
@@ -167,6 +168,24 @@
   .decision-item .meter > i { display:block; height:100%; background:linear-gradient(90deg,#4e91c4,#e1c167); }
   .action-row { display:flex; gap:8px; justify-content:center; margin-top:12px; }
   .action-row button.recommended { border-color:#e4c667; color:#f5dd91; box-shadow:0 0 16px rgba(228,198,103,.14); }
+  .process-dock { display:flex; justify-content:center; align-items:center; gap:12px; margin:16px 0 2px; }
+  .process-dock button { min-width:220px; padding:12px 22px; font-weight:700; border-color:#557a9b; background:linear-gradient(#263b50,#172636); }
+  .process-dock button.ready { border-color:#e2c35f; color:#ffe49a; box-shadow:0 0 22px rgba(226,195,95,.18); }
+  .process-dock .hint { margin:0; max-width:340px; }
+  .stat-gem { cursor:pointer; font:inherit; padding:0; }
+  .stat-gem:hover { filter:brightness(1.15); }
+  .stat-gem::after { content:"편집"; position:absolute; transform:rotate(-45deg); right:-13px; bottom:8px; font-size:9px; color:#9fb0c1; opacity:0; }
+  .stat-gem:hover::after { opacity:1; }
+  .state-editor { margin-top:12px; border:1px solid #48637c; background:#0d1622; border-radius:10px; padding:14px; }
+  .state-editor-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+  .level-buttons, .builder-row { display:flex; flex-wrap:wrap; gap:7px; }
+  .level-buttons button.active, .builder-row button.active { border-color:#e0c064; color:#f6dc8b; background:#2d2a22; }
+  .effect-fields { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin-top:10px; }
+  .builder { border:1px solid #30465b; border-radius:9px; padding:12px; background:rgba(8,14,22,.55); }
+  .builder-label { color:#8fa5b9; font-size:11px; margin:10px 0 6px; }
+  .builder-label:first-child { margin-top:0; }
+  .builder-row button { flex:1; min-width:112px; }
+  .builder-row.modifiers button { min-width:72px; }
 
   @media (max-width: 700px) {
     .wrap { padding: 16px 10px 44px; }
@@ -179,6 +198,8 @@
     ol.opts { grid-template-columns:1fr; max-height:300px; }
     .decision-grid { grid-template-columns:1fr; }
     .gem-meta { grid-template-columns:repeat(2,1fr); }
+    .process-dock { flex-direction:column; }
+    .process-dock button { width:100%; }
   }
 </style>
 </head>
@@ -224,7 +245,7 @@
       </span>
     </div>
     <div class="row">
-      <button class="primary" id="start">계산 시작</button>
+      <button class="primary" id="start">현재 설정 다시 계산</button>
       <button id="manual">현재 진행 중인 젬 입력…</button>
     </div>
     <div class="row hide" id="manualBox">
@@ -249,6 +270,8 @@
       </div>
     </div>
     <div class="state-grid" id="stateGrid"></div>
+    <div id="stateEditor" class="state-editor hide"></div>
+    <div id="centralProcess" class="process-dock"></div>
   </div>
 
   <div class="panel hide" id="choices">
@@ -741,7 +764,20 @@ if (typeof module !== "undefined" && module.exports) {
 // --- UI ----------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const state = { grade: "영웅", policy: null, gem: null, history: [], pending: null,
-                selected: [], awaitingResult: false };
+                selected: [], appliedChoice: null, awaitingResult: false, builderAttr: "will",
+                calculating: 0 };
+
+function snapshot() {
+  return { grade: state.grade, policy: state.policy,
+    gem: state.gem ? Object.assign({}, state.gem) : null,
+    selected: state.selected.slice(), appliedChoice: state.appliedChoice,
+    builderAttr: state.builderAttr };
+}
+function pushHistory() { if (state.gem) state.history.push(snapshot()); }
+function paintGrade() {
+  [...$("grade").children].forEach((b) =>
+    b.setAttribute("aria-pressed", b.dataset.grade === state.grade));
+}
 
 // 설정 위젯 채우기
 $("grade").innerHTML = Object.keys(RULES.grades).map((g) => {
@@ -750,10 +786,12 @@ $("grade").innerHTML = Object.keys(RULES.grades).map((g) => {
 }).join("");
 $("grade").onclick = (e) => {
   const btn = e.target.closest("button[data-grade]");
-  if (!btn) return;
+  if (!btn || btn.dataset.grade === state.grade) return;
+  pushHistory();
   state.grade = btn.dataset.grade;
-  [...$("grade").children].forEach((b) => b.setAttribute("aria-pressed", b === btn));
+  paintGrade();
   syncManualDefaults();
+  calculate(initialState(state.grade), false);
 };
 for (const sel of document.querySelectorAll(".minlv")) {
   sel.innerHTML = ["무시", 2, 3, 4, 5].map((v, i) =>
@@ -762,7 +800,10 @@ for (const sel of document.querySelectorAll(".minlv")) {
 for (const sel of document.querySelectorAll(".curlv")) {
   sel.innerHTML = [1, 2, 3, 4, 5].map((v) => `<option value="${v}">${v}</option>`).join("");
 }
-$("goal").onchange = () => $("customGoal").classList.toggle("hide", $("goal").value !== "custom");
+$("goal").onchange = () => {
+  $("customGoal").classList.toggle("hide", $("goal").value !== "custom");
+  if (state.gem && $("goal").value !== "custom") calculate(Object.assign({}, state.gem), false);
+};
 $("useEffects").onchange = () => $("pGoodWrap").classList.toggle("hide", !$("useEffects").checked);
 $("manual").onclick = () => { $("manualBox").classList.toggle("hide"); syncManualDefaults(); };
 
@@ -796,13 +837,13 @@ function currentGem() {
   return gem;
 }
 
-$("start").onclick = () => {
+function calculate(gemOverride = null, resetHistory = false) {
   let objective, policy, gem;
   try {
     objective = parseGoal(goalSpec());
     policy = new Policy(state.grade, objective,
       $("useEffects").checked ? parseFloat($("pGood").value) : 1);
-    gem = currentGem();
+    gem = gemOverride || currentGem();
     policy._check(gem);
   } catch (err) {
     $("setupHint").textContent = "⚠ " + err.message;
@@ -812,8 +853,10 @@ $("start").onclick = () => {
   $("start").disabled = true;
   $("progress").classList.remove("hide");
 
+  const generation = ++state.calculating;
   const steps = policy.solveSteps();
   const pump = () => {
+    if (generation !== state.calculating) return;
     const t0 = performance.now();
     let step;
     while (!(step = steps.next()).done) {
@@ -827,36 +870,58 @@ $("start").onclick = () => {
     $("start").disabled = false;
     state.policy = policy;
     state.gem = gem;
-    state.history = [];
+    if (resetHistory) state.history = [];
     state.selected = [];
+    state.appliedChoice = null;
     state.awaitingResult = false;
     render();
   };
   setTimeout(pump, 0);
-};
+}
+
+$("start").onclick = () => calculate(null, true);
 
 $("undo").onclick = () => {
   if (!state.history.length) return;
-  state.gem = state.history.pop();
+  state.calculating++;
+  $("progress").classList.add("hide");
+  $("start").disabled = false;
+  const previous = state.history.pop();
+  state.grade = previous.grade;
+  state.policy = previous.policy;
+  state.gem = previous.gem;
+  state.selected = previous.selected;
+  state.appliedChoice = previous.appliedChoice;
+  state.builderAttr = previous.builderAttr;
+  paintGrade();
   state.pending = null;
-  state.selected = [];
   state.awaitingResult = false;
   render();
 };
 $("restart").onclick = () => {
+  pushHistory();
   state.gem = currentGem();
-  state.history = [];
   state.pending = null;
   state.selected = [];
+  state.appliedChoice = null;
   state.awaitingResult = false;
   render();
 };
+
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+    e.preventDefault(); $("undo").click();
+  }
+});
 
 const fmt = (v) => state.policy.objective.isProbability
   ? (v * 100).toFixed(2) + "%" : v.toFixed(3);
 
 function render() {
   const { policy, gem } = state;
+  if (!policy || !gem) return;
+  gem.eff1Name ||= "첫번째 효과";
+  gem.eff2Name ||= "두번째 효과";
   $("session").classList.remove("hide");
   $("undo").disabled = !state.history.length;
   $("value").textContent = fmt(policy.stateValue(gem));
@@ -872,17 +937,36 @@ function render() {
     ["첫번째 효과", gem.eff1 + (gem.eff1Good ? "" : " ✗")],
     ["두번째 효과", gem.eff2 + (gem.eff2Good ? "" : " ✗")],
   ];
-  const statGem = (cls, name, value, good = true) =>
-    `<div class="stat-gem ${cls}"><div><div class="sg-name">${name}</div>` +
-    `<div class="sg-value">Lv. ${value}</div>${good ? "" : `<div class="sg-bad">원하지 않는 효과</div>`}</div></div>`;
+  const statGem = (cls, key, name, value, good = true) =>
+    `<button class="stat-gem ${cls}" data-edit-stat="${key}"><div><div class="sg-name">${name}</div>` +
+    `<div class="sg-value">Lv. ${value}</div>${good ? "" : `<div class="sg-bad">원하지 않는 효과</div>`}</div></button>`;
   $("stateGrid").innerHTML =
     `<div class="gem-stage" aria-label="현재 젬 상태"><div class="gem-core"></div>` +
-    statGem("stat-will", "의지력 효율", gem.will) +
-    statGem("stat-point", "질서/혼돈 포인트", gem.point) +
-    statGem("stat-eff1", "첫번째 효과", gem.eff1, gem.eff1Good) +
-    statGem("stat-eff2", "두번째 효과", gem.eff2, gem.eff2Good) + `</div>` +
+    statGem("stat-will", "will", "의지력 효율", gem.will) +
+    statGem("stat-point", "point", "질서/혼돈 포인트", gem.point) +
+    statGem("stat-eff1", "eff1", gem.eff1Name, gem.eff1, gem.eff1Good) +
+    statGem("stat-eff2", "eff2", gem.eff2Name, gem.eff2, gem.eff2Good) + `</div>` +
     `<div class="gem-meta">${cells.map(([k, v], i) =>
       `<div class="cell${i >= 4 ? " hide" : ""}"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}</div>`;
+  $("stateGrid").onclick = (e) => {
+    const btn = e.target.closest("button[data-edit-stat]");
+    if (btn) openStateEditor(btn.dataset.editStat);
+  };
+
+  const chosenLabel = state.appliedChoice
+    ? RULES.options[OPTION_INDEX[state.appliedChoice]][1] : null;
+  $("centralProcess").innerHTML = `<button id="applyProcess" class="${chosenLabel ? "ready" : ""}" ` +
+    `${chosenLabel ? "" : "disabled"}>가공${chosenLabel ? ` · ${chosenLabel}` : ""}</button>` +
+    `<span class="hint">${chosenLabel ? "인게임에서 적용된 가능성을 반영합니다." :
+      "가능성 4개를 입력한 뒤 실제 적용된 카드 하나를 선택하세요."}</span>`;
+  $("applyProcess").onclick = () => {
+    if (!state.appliedChoice) return;
+    const id = state.appliedChoice;
+    if (RULES.options[OPTION_INDEX[id]][3] === "change") {
+      state.pending = id; return renderChoices();
+    }
+    commitApplied(id, null);
+  };
 
   if (gem.attemptsLeft === 0) {
     $("choices").classList.add("hide");
@@ -898,6 +982,32 @@ function render() {
   renderChoices();
 }
 
+function openStateEditor(key) {
+  const gem = state.gem;
+  const names = ["공격력", "추가 피해", "보스 피해", "낙인력", "아군 피해 강화", "아군 공격 강화", "기타 효과"];
+  const label = { will: "의지력 효율", point: "질서/혼돈 포인트", eff1: "첫번째 효과", eff2: "두번째 효과" }[key];
+  const isEffect = key === "eff1" || key === "eff2";
+  $("stateEditor").classList.remove("hide");
+  $("stateEditor").innerHTML = `<div class="state-editor-head"><b>${label} 편집</b><button id="closeEditor">닫기</button></div>` +
+    `<div class="level-buttons">${[1,2,3,4,5].map((lv) =>
+      `<button data-level="${lv}" class="${gem[key] === lv ? "active" : ""}">Lv. ${lv}</button>`).join("")}</div>` +
+    (isEffect ? `<div class="effect-fields"><label>효과명 <select id="effectName">${names.map((n) =>
+      `<option ${gem[key + "Name"] === n ? "selected" : ""}>${n}</option>`).join("")}</select></label>` +
+      `<label><input id="effectGood" type="checkbox" ${gem[key + "Good"] ? "checked" : ""}> 원하는 효과</label></div>` : "");
+  $("closeEditor").onclick = () => $("stateEditor").classList.add("hide");
+  $("stateEditor").onclick = (e) => {
+    const btn = e.target.closest("button[data-level]");
+    if (!btn) return;
+    pushHistory();
+    state.gem = Object.assign({}, state.gem, { [key]: Number(btn.dataset.level) });
+    $("stateEditor").classList.add("hide"); render();
+  };
+  if (isEffect) {
+    $("effectName").onchange = () => { pushHistory(); state.gem[key + "Name"] = $("effectName").value; render(); };
+    $("effectGood").onchange = () => { pushHistory(); state.gem[key + "Good"] = $("effectGood").checked; render(); };
+  }
+}
+
 function renderChoices() {
   const { policy, gem } = state;
 
@@ -909,7 +1019,7 @@ function renderChoices() {
     if (!id) return `<div class="hand-card empty"><span class="slot-no">0${i + 1}</span>` +
       `<div class="hc-icon"></div><div class="hc-label">가능성 선택</div></div>`;
     const label = RULES.options[OPTION_INDEX[id]][1];
-    return `<button class="hand-card tone-${tone(id)}${state.awaitingResult ? " result-pick" : ""}" data-hand-opt="${id}">` +
+    return `<button class="hand-card tone-${tone(id)}${state.appliedChoice === id ? " applied" : ""}" data-hand-opt="${id}">` +
       `<span class="slot-no">0${i + 1}</span><div class="hc-icon"></div><div class="hc-label">${label}</div></button>`;
   }).join("");
   $("handSlots").innerHTML = slotHtml;
@@ -917,20 +1027,23 @@ function renderChoices() {
     const btn = e.target.closest("button[data-hand-opt]");
     if (!btn) return;
     const id = btn.dataset.handOpt;
-    if (state.awaitingResult) {
-      if (RULES.options[OPTION_INDEX[id]][3] === "change") {
-        state.pending = id; return renderChoices();
-      }
-      return commitApplied(id, null);
+    if (state.selected.length === RULES.handSize) {
+      state.appliedChoice = id;
+      render();
+      return;
     }
     state.selected.splice(state.selected.indexOf(id), 1);
+    state.appliedChoice = null;
     renderChoices();
   };
 
   if (state.pending) {
+    const effectNames = ["공격력", "추가 피해", "보스 피해", "낙인력", "아군 피해 강화", "아군 공격 강화", "기타 효과"];
     $("askBox").classList.remove("hide");
     $("askBox").innerHTML =
-      `<b>${RULES.options[OPTION_INDEX[state.pending]][1]}</b> — 바뀐 효과가 원하는 효과인가요? ` +
+      `<b>${RULES.options[OPTION_INDEX[state.pending]][1]}</b> — 새 효과 ` +
+      `<select id="changedEffectName">${effectNames.map((n) => `<option>${n}</option>`).join("")}</select> ` +
+      `원하는 효과인가요? ` +
       `<button data-good="1">예</button> <button data-good="0">아니오</button> ` +
       `<button data-good="cancel">취소</button>`;
     $("askBox").onclick = (e) => {
@@ -941,7 +1054,7 @@ function renderChoices() {
       const optionId = state.pending;
       state.pending = null;
       if (answer === "cancel") return renderChoices();
-      commitApplied(optionId, answer === "1");
+      commitApplied(optionId, answer === "1", $("changedEffectName").value);
     };
     $("optList").innerHTML = "";
     $("pickerTitle").innerHTML = "";
@@ -952,16 +1065,30 @@ function renderChoices() {
   $("askBox").innerHTML = "";
 
   const rows = policy.optionValues(gem).filter((row) => row.available);
-  const shown = state.awaitingResult ? [] : rows;
-  let html = shown.map((row) => {
-    const selected = state.selected.includes(row.id);
-    return `<li><button class="opt tone-${tone(row.id)}${selected ? " top" : ""}" data-opt="${row.id}">` +
-      `<span class="rank">${selected ? "✓" : ""}</span><span>${row.label}</span>` +
-      `<span class="appear">기준 등장률 ${(row.appearProb * 100).toFixed(2)}%</span>` +
-      `<span class="val">적용 시 ${fmt(row.value)}</span></button></li>`;
+  const rowMap = Object.fromEntries(rows.map((r) => [r.id, r]));
+  const attrInfo = [
+    ["will", "의지력 효율"], ["point", "질서/혼돈 포인트"],
+    ["eff1", "첫번째 효과"], ["eff2", "두번째 효과"],
+  ];
+  const modifiers = [-1, 1, 2, 3, 4].map((delta) => {
+    const id = `${state.builderAttr}${delta > 0 ? "+" : ""}${delta}`;
+    const row = rowMap[id];
+    if (!row) return "";
+    return `<button data-opt="${id}" class="${state.selected.includes(id) ? "active" : ""}">` +
+      `${delta < 0 ? "−1 감소" : `+${delta} 증가`}</button>`;
   }).join("");
-  $("optList").innerHTML = html;
+  const changeId = state.builderAttr === "eff1" ? "chg1" : state.builderAttr === "eff2" ? "chg2" : null;
+  const specials = [changeId, "cost+", "cost-", "keep", "reroll+1", "reroll+2"]
+    .filter((id) => id && rowMap[id]).map((id) =>
+      `<button data-opt="${id}" class="${state.selected.includes(id) ? "active" : ""}>${RULES.options[OPTION_INDEX[id]][1]}</button>`).join("");
+  $("optList").innerHTML = `<li style="grid-column:1/-1"><div class="builder">` +
+    `<div class="builder-label">1. 옵션 종류</div><div class="builder-row">${attrInfo.map(([id, label]) =>
+      `<button data-attr="${id}" class="${state.builderAttr === id ? "active" : ""}">${label}</button>`).join("")}</div>` +
+    `<div class="builder-label">2. 변화량</div><div class="builder-row modifiers">${modifiers}</div>` +
+    `<div class="builder-label">기타 가능성</div><div class="builder-row">${specials}</div></div></li>`;
   $("optList").onclick = (e) => {
+    const attr = e.target.closest("button[data-attr]");
+    if (attr) { state.builderAttr = attr.dataset.attr; return renderChoices(); }
     const btn = e.target.closest("button[data-opt]");
     if (!btn) return;
     const optionId = btn.dataset.opt;
@@ -969,6 +1096,7 @@ function renderChoices() {
       const pos = state.selected.indexOf(optionId);
       if (pos >= 0) state.selected.splice(pos, 1);
       else if (state.selected.length < RULES.handSize) state.selected.push(optionId);
+      state.appliedChoice = null;
       return renderChoices();
     }
     if (RULES.options[OPTION_INDEX[optionId]][3] === "change") {
@@ -978,12 +1106,6 @@ function renderChoices() {
     commitApplied(optionId, null);
   };
 
-  if (state.awaitingResult) {
-    $("pickerTitle").innerHTML = `<b>가공 결과 입력</b><span>실제로 적용된 카드를 누르세요</span>`;
-    $("rerollBox").innerHTML = `<div class="decision"><div class="decision-head"><b>어떤 가능성이 적용됐나요?</b>` +
-      `<span class="hint">인게임에서 빛난 카드와 같은 카드를 선택하세요</span></div></div>`;
-    return;
-  }
   $("pickerTitle").innerHTML = `<b>가능성 선택기</b><span>인게임에 표시된 항목을 차례로 4개 고르세요</span>`;
   if (state.selected.length < RULES.handSize) {
     $("rerollBox").innerHTML = `<div class="hint">현재 선택 ${state.selected.length}/4 · 같은 가능성은 한 번만 선택할 수 있습니다.</div>`;
@@ -1002,29 +1124,34 @@ function renderChoices() {
     `<div class="di-value">${fmt(value)}</div><div class="meter"><i style="width:${Math.max(3, value / maxValue * 100).toFixed(1)}%"></i></div></div>`).join("");
   $("rerollBox").innerHTML = `<div class="decision"><div class="decision-head"><span>행동별 목표 기대치</span>` +
     `<b>추천 · ${names[decision.action]}</b></div><div class="decision-grid">${comparisons}</div>` +
-    `<div class="action-row"><button id="doProcess" class="${decision.action === "process" ? "recommended" : ""}">가공하기</button>` +
+    `<div class="action-row">` +
     (decision.rerollValue !== null ? `<button id="doReroll" class="${decision.action === "reroll" ? "recommended" : ""}">다른 항목 보기 (${gem.rerollsLeft})</button>` : "") +
     (decision.completeValue !== null ? `<button id="doComplete" class="${decision.action === "complete" ? "recommended" : ""}">가공 완료</button>` : "") + `</div></div>`;
-  $("doProcess").onclick = () => { state.awaitingResult = true; renderChoices(); };
   if ($("doReroll")) $("doReroll").onclick = () => {
-    state.history.push(Object.assign({}, gem));
+    pushHistory();
     state.gem = Object.assign({}, gem, { rerollsLeft: gem.rerollsLeft - 1 });
-    state.selected = []; state.awaitingResult = false; render();
+    state.selected = []; state.appliedChoice = null; render();
   };
   if ($("doComplete")) $("doComplete").onclick = () => {
-    state.history.push(Object.assign({}, gem));
+    pushHistory();
     state.gem = Object.assign({}, gem, { attemptsLeft: 0 });
-    state.selected = []; state.awaitingResult = false; render();
+    state.selected = []; state.appliedChoice = null; render();
   };
 }
 
-function commitApplied(optionId, newGood) {
-  state.history.push(Object.assign({}, state.gem));
+function commitApplied(optionId, newGood, newName = null) {
+  pushHistory();
   state.gem = applyOption(state.gem, optionId, newGood, state.policy.maxRerolls);
+  if (newName && optionId === "chg1") state.gem.eff1Name = newName;
+  if (newName && optionId === "chg2") state.gem.eff2Name = newName;
   state.selected = [];
+  state.appliedChoice = null;
   state.awaitingResult = false;
   render();
 }
+
+// 첫 진입부터 계산기 전체를 보여 준다. 등급 변경도 같은 계산 경로를 사용한다.
+calculate(initialState(state.grade), true);
 </script>
 </body>
 </html>
