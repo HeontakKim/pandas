@@ -118,8 +118,8 @@
   @keyframes orbit { to { transform: rotate(360deg); } }
   .gem-core { position: absolute; z-index: 2; width: 82px; height: 82px; transform: rotate(45deg); border: 2px solid #75b6e3; background: radial-gradient(circle at 35% 30%, #3bb8d6, #16406a 55%, #0b1830); box-shadow: 0 0 0 7px #101b2a, 0 0 0 9px #496d8d, 0 0 35px rgba(69,180,233,.45); }
   .gem-core::after { content: "◆"; display: grid; place-items: center; width: 100%; height: 100%; transform: rotate(-45deg); color: #d8f6ff; font-size: 34px; text-shadow: 0 0 14px white; }
-  .stat-gem { position: absolute; z-index: 3; width: 106px; height: 106px; transform: rotate(45deg); border: 2px solid currentColor; background: #101722; box-shadow: 0 0 0 5px #0b111a, 0 0 22px color-mix(in srgb, currentColor 35%, transparent); display: grid; place-items: center; }
-  .stat-gem > div { transform: rotate(-45deg); text-align: center; width: 120px; line-height: 1.25; }
+  .stat-gem { position: absolute; z-index: 3; width: 106px; height: 106px; transform: rotate(45deg); border: 2px solid currentColor; background: #101722; box-shadow: 0 0 0 5px #0b111a, 0 0 22px color-mix(in srgb, currentColor 35%, transparent); }
+  .stat-gem > div { position:absolute; left:50%; top:50%; width:128px; min-height:76px; transform:translate(-50%,-50%) rotate(-45deg); display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; line-height:1.25; }
   .stat-gem .sg-name { font-size: 12px; color: #e4edf5; }
   .stat-gem .sg-value { font-size: 25px; font-weight: 800; color: currentColor; }
   .stat-gem .sg-bad { font-size: 10px; color: #ef8d8d; }
