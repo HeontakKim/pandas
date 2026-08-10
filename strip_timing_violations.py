@@ -7,7 +7,8 @@ SDF annotation 시뮬레이션 로그(sim.log)를 정리하고, 지워진 정보
 형태로 남긴다. 한 번의 streaming pass 로 아래를 모두 처리한다.
 
   - Timing violation 블록(5줄) 제거 -> scope 별로 집계해서 DB 에 보관
-  - 반복되는 xcelium deposit + PNOOBJ 짝(2줄) 제거 -> 남길 정보가 없어 그냥 버림
+  - 반복되는 xcelium deposit 줄과 PNOOBJ 에러 줄 제거 -> 남길 정보가 없어 그냥 버림
+    (--keep-deposit 로 끄고, --deposit-pairs-only 로 짝일 때만 지운다)
 
 산출물:
   sim.clean.log       정리된 로그
@@ -219,7 +220,8 @@ class ViolationStore:
         self.pending = {}  # key -> [count, min_fs, max_fs]
         self.total = 0
         self.unparsed = 0
-        self.pruned = 0
+        self.pruned_dep = 0
+        self.pruned_err = 0
 
         if keep_detail:
             if os.path.exists(detail_path):
@@ -321,6 +323,7 @@ def _strip_python_file(src, dst, store, args):
     # 루프 안에 별도의 'if enabled' 분기를 두지 않아도 된다.
     INF = float("inf")
     prune_dep = not getattr(args, "keep_deposit", False)
+    pairs_only = getattr(args, "deposit_pairs_only", False)
     every_line = INF if args.no_progress else args.progress_lines
     every_viol = INF if args.no_progress else args.progress_violations
     line_mark = every_line
@@ -342,22 +345,32 @@ def _strip_python_file(src, dst, store, args):
             # C 레벨이라 여기서 대부분의 줄이 즉시 통과한다.
             if line[:8] != HEADER_PREFIX or HEADER_KEY not in line:
 
-                # deposit + PNOOBJ 짝이면 두 줄을 통째로 버린다
-                if prune_dep and line[:8] == PRUNE_P1_PREFIX \
-                        and RE_DEPOSIT.match(line):
-                    nl2 = nxt()
-                    if nl2:
-                        if nl2[:6] == PRUNE_P2_PREFIX and RE_PNOOBJ.match(nl2):
-                            nbytes += len(nl2)
-                            nline += 1
-                            store.pruned += 1
+                # deposit 줄 / PNOOBJ 줄 제거. 둘 다 'x' 로 시작한다.
+                if prune_dep and line[:1] == b"x":
+                    if line[:8] == PRUNE_P1_PREFIX and RE_DEPOSIT.match(line):
+                        if not pairs_only:
+                            store.pruned_dep += 1   # 짝이든 아니든 버린다
                             line = nxt()
                             continue
-                        write(line)
-                        kept += 1
-                        # 짝이 아니다 -> 다음 줄을 새로 판정한다.
-                        # 세는 건 루프 상단이 하므로 여기서 세면 이중 계산이 된다.
-                        line = nl2
+                        nl2 = nxt()
+                        if nl2:
+                            if nl2[:6] == PRUNE_P2_PREFIX and RE_PNOOBJ.match(nl2):
+                                nbytes += len(nl2)
+                                nline += 1
+                                store.pruned_dep += 1
+                                store.pruned_err += 1
+                                line = nxt()
+                                continue
+                            write(line)
+                            kept += 1
+                            # 짝이 아니다 -> 다음 줄을 새로 판정한다.
+                            # 세는 건 루프 상단이 하므로 여기서 세면 이중 계산이 된다.
+                            line = nl2
+                            continue
+                    elif (not pairs_only and line[:6] == PRUNE_P2_PREFIX
+                            and RE_PNOOBJ.match(line)):
+                        store.pruned_err += 1
+                        line = nxt()
                         continue
 
                 write(line)
@@ -514,6 +527,8 @@ def _strip_with_c(args, exe):
         cmdbase.append("--keep-blank")
     if args.keep_deposit:
         cmdbase.append("--keep-deposit")
+    if args.deposit_pairs_only:
+        cmdbase.append("--deposit-pairs-only")
     cmdbase += ["--progress-lines", str(args.progress_lines),
                 "--progress-violations", str(args.progress_violations),
                 "--warn-bytes", "0"]
@@ -636,10 +651,11 @@ def strip(args):
            _human(os.path.getsize(args.detail)) if not args.no_detail else "-",
            format(store.total, ","), format(tk, ","))
     )
-    if store.pruned:
+    if store.pruned_dep or store.pruned_err:
         sys.stderr.write(
-            "  deposit   : %s 짝 (%s 줄) 삭제 (xcelium deposit + PNOOBJ)\n"
-            % (format(store.pruned, ","), format(store.pruned * 2, ","))
+            "  deposit   : %s 줄 + PNOOBJ %s 줄 = %s 줄 삭제\n"
+            % (format(store.pruned_dep, ","), format(store.pruned_err, ","),
+               format(store.pruned_dep + store.pruned_err, ","))
         )
     if store.unparsed:
         sys.stderr.write(
@@ -666,9 +682,10 @@ def strip(args):
 # 달라져도 조용히 매칭에 실패해서 아무것도 지워지지 않기 때문이다.
 # (C 판 is_deposit_cmd() 와 같은 규칙이다. 두 엔진이 어긋나면 안 된다.)
 #
-# 안전장치는 정규식이 아니라 '짝' 조건이다. 다음 줄이 PNOOBJ 에러일 때만
-# 둘 다 지운다. deposit 이 성공하면 뒤에 에러 줄이 붙지 않으므로,
-# 성공한 deposit 은 어떤 형태이든 그대로 살아남는다.
+# 기본값은 deposit 줄과 PNOOBJ 줄을 서로 독립적으로 지우는 것이다. deposit 이
+# 성공해서 에러 줄이 안 붙은 경우까지 전부 지운다. 짝을 맞출 필요가 없으니
+# 앞뒤를 살펴볼 일도 없어서 더 단순하고 빠르다.
+# --deposit-pairs-only 를 주면 'deposit + 바로 뒤 PNOOBJ' 짝일 때만 지운다.
 # ---------------------------------------------------------------------------
 PRUNE_P1_PREFIX = b"xcelium>"
 PRUNE_P2_PREFIX = b"xmsim:"
@@ -694,6 +711,8 @@ def _prune_with_c(args, exe):
     dst = os.devnull if args.dry_run else _prune_dst(args)
 
     cmd = [exe, src, "-o", dst, "--prune-only", "--warn-bytes", "0"]
+    if args.deposit_pairs_only:
+        cmd.append("--deposit-pairs-only")
     if args.no_progress:
         cmd.append("--no-progress")
     else:
@@ -725,7 +744,8 @@ def prune(args):
     src = args.logfile
     dst = _prune_dst(args)
 
-    n = nbytes = nline = 0
+    n_dep = n_err = nbytes = nline = 0
+    pairs_only = args.deposit_pairs_only
     total = os.path.getsize(src)
     t0 = time.time()
     eol = "\r" if sys.stderr.isatty() else "\n"
@@ -734,9 +754,9 @@ def prune(args):
     def report(final=False):
         el = time.time() - t0
         sys.stderr.write(
-            "[prune] %5.1f%% %13s lines %9s 짝 %9s %6.1f MB/s   %s"
+            "[prune] %5.1f%% %13s lines %9s 삭제 %9s %6.1f MB/s   %s"
             % (nbytes * 100.0 / total if total else 0.0,
-               format(nline, ","), format(n, ","), _human(nbytes),
+               format(nline, ","), format(n_dep + n_err, ","), _human(nbytes),
                (nbytes / el if el else 0) / 1e6, "\n" if final else eol))
         sys.stderr.flush()
 
@@ -750,8 +770,8 @@ def prune(args):
             nbytes += len(line)
             nline += 1
 
-            # fast path: 대부분의 줄은 8바이트 비교 한 번으로 통과한다
-            if line[:8] != PRUNE_P1_PREFIX or not RE_DEPOSIT.match(line):
+            # fast path: 대부분의 줄은 1~8바이트 비교로 통과한다
+            if line[:1] != b"x":
                 if write is not None:
                     write(line)
                 if nline >= mark:
@@ -760,6 +780,25 @@ def prune(args):
                 line = nxt()
                 continue
 
+            is_dep = line[:8] == PRUNE_P1_PREFIX and RE_DEPOSIT.match(line)
+
+            if is_dep and not pairs_only:
+                n_dep += 1                # 짝이든 아니든 버린다
+                line = nxt()
+                continue
+
+            if not is_dep:
+                if (not pairs_only and line[:6] == PRUNE_P2_PREFIX
+                        and RE_PNOOBJ.match(line)):
+                    n_err += 1
+                    line = nxt()
+                    continue
+                if write is not None:
+                    write(line)
+                line = nxt()
+                continue
+
+            # 여기부터는 pairs_only 모드의 deposit 줄
             nxt_line = nxt()
             if not nxt_line:
                 if write is not None:
@@ -769,7 +808,8 @@ def prune(args):
             if nxt_line[:6] == PRUNE_P2_PREFIX and RE_PNOOBJ.match(nxt_line):
                 nbytes += len(nxt_line)
                 nline += 1
-                n += 1
+                n_dep += 1
+                n_err += 1
                 line = nxt()          # 짝을 통째로 버린다
                 continue
 
@@ -786,9 +826,10 @@ def prune(args):
         report(final=True)
 
     if args.dry_run:
-        sys.stderr.write("\n[prune / dry-run] deposit/PNOOBJ %s 짝 (%s 줄) 발견. "
-                         "파일은 만들지 않았습니다.\n"
-                         % (format(n, ","), format(n * 2, ",")))
+        sys.stderr.write("\n[prune / dry-run] deposit %s 줄 + PNOOBJ %s 줄 "
+                         "= %s 줄 발견. 파일은 만들지 않았습니다.\n"
+                         % (format(n_dep, ","), format(n_err, ","),
+                            format(n_dep + n_err, ",")))
         return
 
     if args.in_place:
@@ -802,9 +843,10 @@ def prune(args):
         "\n[prune 완료] %.1fs\n"
         "  입력      : %-28s %12s\n"
         "  결과      : %-28s %12s\n"
-        "  제거      : %s 짝 (%s 줄)  %s 절감\n"
+        "  제거      : deposit %s 줄 + PNOOBJ %s 줄 = %s 줄  (%s 절감)\n"
         % (time.time() - t0, src, _human(nbytes), final_path, _human(out_size),
-           format(n, ","), format(n * 2, ","), _human(nbytes - out_size))
+           format(n_dep, ","), format(n_err, ","),
+           format(n_dep + n_err, ","), _human(nbytes - out_size))
     )
 
 
@@ -941,7 +983,10 @@ def main():
     s.add_argument("--keep-blank", action="store_true",
                    help="violation 블록 뒤의 빈 줄을 지우지 않음")
     s.add_argument("--keep-deposit", action="store_true",
-                   help="반복되는 xcelium deposit + PNOOBJ 짝을 지우지 않음")
+                   help="xcelium deposit / PNOOBJ 줄을 지우지 않음")
+    s.add_argument("--deposit-pairs-only", action="store_true",
+                   help="deposit + 바로 뒤 PNOOBJ 짝일 때만 지움 "
+                        "(성공한 deposit 은 보존)")
     s.add_argument("--progress-lines", type=int, default=1_000_000,
                    metavar="N", help="N 줄마다 진행률 출력 (기본: 1000000)")
     s.add_argument("--progress-violations", type=int, default=1000,
@@ -959,6 +1004,9 @@ def main():
     pr.add_argument("--out", help="결과 파일 (기본: <입력>.pruned.log)")
     pr.add_argument("--in-place", action="store_true",
                     help="임시 파일에 쓴 뒤 원본을 교체 (원자적)")
+    pr.add_argument("--deposit-pairs-only", action="store_true",
+                    help="deposit + 바로 뒤 PNOOBJ 짝일 때만 지움 "
+                         "(성공한 deposit 은 보존)")
     pr.add_argument("--dry-run", action="store_true",
                     help="개수만 세고 파일은 만들지 않음")
     pr.add_argument("--progress-lines", type=int, default=1_000_000, metavar="N",

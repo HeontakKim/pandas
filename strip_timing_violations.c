@@ -6,8 +6,8 @@
  *
  * 한 번의 pass 에서 두 가지를 지운다:
  *   - Timing violation 블록 (5줄) -> scope 별로 집계해 TSV 로 내보낸다
- *   - xcelium deposit + PNOOBJ 짝 (2줄) -> 남길 정보가 없어 그냥 버린다
- *     (--keep-deposit 로 끌 수 있다)
+ *   - xcelium deposit 줄과 PNOOBJ 에러 줄 -> 남길 정보가 없어 그냥 버린다
+ *     (--keep-deposit 로 끄고, --deposit-pairs-only 로 짝일 때만 지운다)
  *
  * 둘을 같은 pass 에서 처리하는 게 핵심이다. 따로 돌리면 10GB 를 한 번 더
  * 읽고 써야 하지만, 여기에 넣으면 줄마다 바이트 비교 한 번이 늘 뿐이다.
@@ -498,6 +498,7 @@ int main(int argc, char **argv)
     unsigned long long prog_lines = 1000000, prog_viol = 1000;
     unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
     int no_progress = 0, keep_blank = 0, prune_deposit = 1, prune_only = 0;
+    int pairs_only = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -513,6 +514,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
         else if (!strcmp(a, "--keep-deposit"))      prune_deposit = 0;
         else if (!strcmp(a, "--prune-only"))        prune_only = 1;
+        else if (!strcmp(a, "--deposit-pairs-only")) pairs_only = 1;
         else if (a[0] == '-' && a[1])
             die("알 수 없는 옵션: %s", a);
         else if (!in_path)                          in_path = a;
@@ -542,7 +544,7 @@ int main(int argc, char **argv)
     Agg agg;  agg_init(&agg);
 
     unsigned long long nline = 0, nviol = 0, kept = 0, unparsed = 0;
-    unsigned long long npruned = 0;
+    unsigned long long ndep = 0, nerr = 0;
     unsigned long long nbytes = 0;
     unsigned long long line_mark = prog_lines, viol_mark = prog_viol;
     double t0 = now_sec();
@@ -577,22 +579,30 @@ int main(int argc, char **argv)
             memcmp(p, HDR, HDR_LEN) != 0 ||
             !memmem(p, l, HKEY, sizeof(HKEY) - 1)) {
 
-            /* deposit + PNOOBJ 짝이면 두 줄을 통째로 버린다 */
-            if (prune_deposit && p[0] == 'x' && is_deposit_cmd(p, l)) {
-                unsigned char *q;
-                size_t ql;
-                if (rd_line(&r, &q, &ql)) {
-                    if (is_pnoobj_err(q, ql)) {
-                        nbytes += ql;       /* 소비했으므로 센다 */
-                        nline++;
-                        npruned++;
-                        if (!no_progress && nline >= line_mark) {
-                            line_mark += prog_lines;
-                            REPORT(0);
-                        }
+            /* deposit 줄과 PNOOBJ 줄을 버린다.
+             * 둘 다 'x' 로 시작하므로 바이트 하나로 먼저 걸러낸다. */
+            if (prune_deposit && p[0] == 'x') {
+                if (is_deposit_cmd(p, l)) {
+                    if (!pairs_only) {
+                        ndep++;             /* 짝이든 아니든 그냥 버린다 */
                         continue;
                     }
-                    rd_unget(&r, ql);       /* 짝이 아니다 -> 되돌린다(세지 않음) */
+                    /* pairs_only: 다음 줄이 에러일 때만 둘 다 버린다 */
+                    unsigned char *q;
+                    size_t ql;
+                    if (rd_line(&r, &q, &ql)) {
+                        if (is_pnoobj_err(q, ql)) {
+                            nbytes += ql;   /* 소비했으므로 센다 */
+                            nline++;
+                            ndep++;
+                            nerr++;
+                            continue;
+                        }
+                        rd_unget(&r, ql);   /* 짝이 아니다 -> 되돌린다(세지 않음) */
+                    }
+                } else if (!pairs_only && is_pnoobj_err(p, l)) {
+                    nerr++;
+                    continue;
                 }
             }
 
@@ -751,10 +761,10 @@ int main(int argc, char **argv)
                 "  violation : %llu 건  (남긴 줄 %llu)\n",
                 dt, dt > 0 ? nbytes / 1e6 / dt : 0,
                 in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
-    if (npruned)
+    if (ndep || nerr)
         fprintf(stderr,
-                "  deposit   : %llu 짝 (%llu 줄) 삭제 (xcelium deposit + PNOOBJ)\n",
-                npruned, npruned * 2);
+                "  deposit   : %llu 줄 + PNOOBJ %llu 줄 = %llu 줄 삭제\n",
+                ndep, nerr, ndep + nerr);
     if (unparsed)
         fprintf(stderr,
                 "  주의: 형식이 다른 violation 후보 %llu 건은 원본에 남겼습니다.\n",
