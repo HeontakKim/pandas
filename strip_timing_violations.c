@@ -573,6 +573,17 @@ int main(int argc, char **argv)
     while (rd_line(&r, &p, &l)) {
         nline++; nbytes += l;
 
+        /* 진행률은 줄을 읽은 직후에 확인한다. 아래 분기 안쪽에 두면
+         * 버려지는 줄(deposit/PNOOBJ, violation 블록)에서 continue 로
+         * 빠져나가 검사를 건너뛴다. 잡음이 한 구간에 몰려 있는 실제
+         * 로그에서는 그 구간 내내 화면이 멈춘 것처럼 보인다.
+         * mark 를 더하지 않고 현재 위치 기준으로 다시 잡는 것도 같은 이유다.
+         * 뒤처진 mark 를 += 로 따라잡으면 한 줄씩 연속으로 출력된다. */
+        if (!no_progress && nline >= line_mark) {
+            line_mark = nline + prog_lines;
+            REPORT(0);
+        }
+
         /* ---- fast path: 대부분의 줄은 여기서 끝난다 ----
          * p[0] 한 바이트 비교로 대부분이 걸러지므로 memcmp/memmem 까지 가지 않는다. */
         if (prune_only || l < HDR_LEN || p[0] != 'W' ||
@@ -608,15 +619,7 @@ int main(int argc, char **argv)
 
             wr_put(&w, p, l);
             kept++;
-            if (!no_progress && nline >= line_mark) {
-                line_mark += prog_lines;
-                REPORT(0);
-            }
             continue;
-        }
-        if (!no_progress && nline >= line_mark) {
-            line_mark += prog_lines;
-            REPORT(0);
         }
 
         /* ---- violation 블록 후보 ---- */

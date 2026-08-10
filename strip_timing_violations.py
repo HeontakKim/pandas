@@ -31,6 +31,7 @@ SDF annotation 시뮬레이션 로그(sim.log)를 정리하고, 지워진 정보
 
   # deposit 잡음만 지우기 (timing violation 은 건드리지 않음)
   python3 strip_timing_violations.py prune sim.log --in-place
+  python3 strip_timing_violations.py prune *.log --in-place   # 여러 개, 병렬
 
 메모리 사용량은 입력 파일 크기와 무관하며(스트리밍 + 주기적 flush),
 10GB 이상의 로그도 상수 메모리로 처리한다.
@@ -340,6 +341,15 @@ def _strip_python_file(src, dst, store, args):
             nbytes += len(line)
             nline += 1
 
+            # 진행률은 줄을 읽은 직후에 확인한다. 아래 분기 안쪽에 두면
+            # 버려지는 줄(deposit/PNOOBJ, violation 블록)에서 continue 로
+            # 빠져나가 검사를 건너뛴다. 잡음이 한 구간에 몰려 있는 실제
+            # 로그에서는 그 구간 내내 화면이 멈춘 것처럼 보인다.
+            # mark 를 더하지 않고 현재 위치 기준으로 다시 잡는 것도 같은 이유다.
+            if nline >= line_mark:
+                line_mark = nline + every_line
+                report()
+
             # ---- fast path -----------------------------------------------
             # 전체 줄의 99% 이상은 violation 이 아니다. bytes slice 비교는
             # C 레벨이라 여기서 대부분의 줄이 즉시 통과한다.
@@ -375,15 +385,8 @@ def _strip_python_file(src, dst, store, args):
 
                 write(line)
                 kept += 1
-                if nline >= line_mark:          # 나눗셈(%)보다 비교가 싸다
-                    line_mark += every_line
-                    report()
                 line = nxt()
                 continue
-
-            if nline >= line_mark:
-                line_mark += every_line
-                report()
 
             # ---- violation 블록 후보 --------------------------------------
             block = []
@@ -694,39 +697,65 @@ RE_PNOOBJ = re.compile(
     rb"^xmsim:\s*\*SE,PNOOBJ:\s*Path element could not be found:")
 
 
-def _prune_dst(args):
-    src = args.logfile
+def _prune_dst(args, src):
+    if args.dry_run:
+        # dry-run 은 /dev/null 로 흘려보내면 개수만 세는 것과 같다.
+        return os.devnull
     if args.in_place:
         return src + ".prune.tmp"
     dst = args.out or (os.path.splitext(src)[0] + ".pruned.log")
     if os.path.abspath(src) == os.path.abspath(dst):
-        sys.exit("error: 입력과 출력 경로가 같습니다. --out 을 지정하세요.")
+        sys.exit("error: 입력과 출력 경로가 같습니다: %s" % src)
     return dst
 
 
 def _prune_with_c(args, exe):
     """C 의 --prune-only 모드로 처리한다. strip 과 같은 엔진을 쓴다."""
-    src = args.logfile
-    # dry-run 은 /dev/null 로 흘려보내면 개수만 세는 것과 같다.
-    dst = os.devnull if args.dry_run else _prune_dst(args)
+    jobs = [(src, _prune_dst(args, src)) for src in args.logfile]
+    # --in-place 는 원본을 덮어쓰므로 입력 크기를 미리 재둬야 한다.
+    total_in = sum(os.path.getsize(s) for s, _ in jobs)
 
-    cmd = [exe, src, "-o", dst, "--prune-only", "--warn-bytes", "0"]
+    base = [exe, "--prune-only", "--warn-bytes", "0"]
     if args.deposit_pairs_only:
-        cmd.append("--deposit-pairs-only")
+        base.append("--deposit-pairs-only")
     if args.no_progress:
-        cmd.append("--no-progress")
+        base.append("--no-progress")
     else:
-        cmd += ["--progress-lines", str(args.progress_lines)]
+        base += ["--progress-lines", str(args.progress_lines)]
 
-    if subprocess.run(cmd).returncode != 0:
-        sys.exit("error: C 엔진 prune 실패: %s" % src)
+    t0 = time.time()
+    par = max(1, args.jobs)
+    running = []
+    pending = list(jobs)
+    failed = []
+
+    # 파일 여러 개를 코어 수만큼 동시에 돌린다.
+    while pending or running:
+        while pending and len(running) < par:
+            src, dst = pending.pop(0)
+            running.append((subprocess.Popen(base + [src, "-o", dst]), src, dst))
+        p, src, dst = running.pop(0)
+        if p.wait() != 0:
+            failed.append(src)
+
+    if failed:
+        sys.exit("error: C 엔진 prune 실패: %s" % ", ".join(failed))
 
     if args.dry_run:
-        sys.stderr.write("  (--dry-run: 파일을 만들지 않았습니다)\n")
+        sys.stderr.write("\n  (--dry-run: 파일을 만들지 않았습니다)\n")
         return
     if args.in_place:
-        os.replace(dst, src)      # 같은 파일시스템이면 원자적으로 교체된다
-        sys.stderr.write("  원본을 교체했습니다: %s\n" % src)
+        for src, dst in jobs:
+            os.replace(dst, src)   # 같은 파일시스템이면 원자적으로 교체된다
+        sys.stderr.write("\n  원본 %d개를 교체했습니다.\n" % len(jobs))
+
+    if len(jobs) > 1:
+        finals = [s if args.in_place else d for s, d in jobs]
+        total_out = sum(os.path.getsize(f) for f in finals if os.path.exists(f))
+        sys.stderr.write(
+            "\n[prune 전체 완료] %.1fs, %d개 파일  %s -> %s (%s 절감)\n"
+            % (time.time() - t0, len(jobs), _human(total_in), _human(total_out),
+               _human(total_in - total_out)))
 
 
 def prune(args):
@@ -736,14 +765,32 @@ def prune(args):
         exe = find_or_build_c(quiet=args.no_progress)
         if exe is None and args.engine == "c":
             sys.exit("error: C 엔진을 쓸 수 없습니다 (컴파일러 또는 %s 없음)" % C_SRC)
+    if args.out and len(args.logfile) > 1:
+        sys.exit("error: --out 은 입력이 하나일 때만 쓸 수 있습니다.")
     if exe is not None:
         return _prune_with_c(args, exe)
     if args.engine == "auto":
         sys.stderr.write("[안내] C 엔진을 쓸 수 없어 파이썬으로 처리합니다.\n")
 
-    src = args.logfile
-    dst = _prune_dst(args)
+    t_all = time.time()
+    tot_in = tot_out = tot_dep = tot_err = 0
+    for src in args.logfile:
+        d_in, d_out, d_dep, d_err = _prune_python_file(src, _prune_dst(args, src),
+                                                       args)
+        tot_in += d_in; tot_out += d_out
+        tot_dep += d_dep; tot_err += d_err
 
+    if len(args.logfile) > 1 and not args.dry_run:
+        sys.stderr.write(
+            "\n[prune 전체 완료] %.1fs, %d개 파일  %s -> %s (%s 절감)\n"
+            "  제거      : deposit %s 줄 + PNOOBJ %s 줄\n"
+            % (time.time() - t_all, len(args.logfile), _human(tot_in),
+               _human(tot_out), _human(tot_in - tot_out),
+               format(tot_dep, ","), format(tot_err, ",")))
+
+
+def _prune_python_file(src, dst, args):
+    """파일 하나를 파이썬으로 처리한다. (입력크기, 출력크기, dep, err)."""
     n_dep = n_err = nbytes = nline = 0
     pairs_only = args.deposit_pairs_only
     total = os.path.getsize(src)
@@ -754,8 +801,9 @@ def prune(args):
     def report(final=False):
         el = time.time() - t0
         sys.stderr.write(
-            "[prune] %5.1f%% %13s lines %9s 삭제 %9s %6.1f MB/s   %s"
-            % (nbytes * 100.0 / total if total else 0.0,
+            "[prune] %-16s %5.1f%% %13s lines %9s 삭제 %9s %6.1f MB/s   %s"
+            % (os.path.basename(src)[:16],
+               nbytes * 100.0 / total if total else 0.0,
                format(nline, ","), format(n_dep + n_err, ","), _human(nbytes),
                (nbytes / el if el else 0) / 1e6, "\n" if final else eol))
         sys.stderr.flush()
@@ -770,13 +818,15 @@ def prune(args):
             nbytes += len(line)
             nline += 1
 
+            # 진행률은 줄을 읽은 직후에 확인한다(버려지는 줄 포함).
+            if nline >= mark:
+                mark = nline + args.progress_lines
+                report()
+
             # fast path: 대부분의 줄은 1~8바이트 비교로 통과한다
             if line[:1] != b"x":
                 if write is not None:
                     write(line)
-                if nline >= mark:
-                    mark += args.progress_lines
-                    report()
                 line = nxt()
                 continue
 
@@ -826,11 +876,11 @@ def prune(args):
         report(final=True)
 
     if args.dry_run:
-        sys.stderr.write("\n[prune / dry-run] deposit %s 줄 + PNOOBJ %s 줄 "
+        sys.stderr.write("\n[prune / dry-run] %s: deposit %s 줄 + PNOOBJ %s 줄 "
                          "= %s 줄 발견. 파일은 만들지 않았습니다.\n"
-                         % (format(n_dep, ","), format(n_err, ","),
+                         % (src, format(n_dep, ","), format(n_err, ","),
                             format(n_dep + n_err, ",")))
-        return
+        return nbytes, 0, n_dep, n_err
 
     if args.in_place:
         os.replace(dst, src)          # 같은 파일시스템이면 원자적으로 교체된다
@@ -848,6 +898,7 @@ def prune(args):
            format(n_dep, ","), format(n_err, ","),
            format(n_dep + n_err, ","), _human(nbytes - out_size))
     )
+    return nbytes, out_size, n_dep, n_err
 
 
 def _human(n):
@@ -998,10 +1049,14 @@ def main():
 
     pr = sub.add_parser(
         "prune", help="반복되는 deposit/PNOOBJ 잡음 두 줄짜리 짝을 삭제 (DB 없음)")
-    pr.add_argument("logfile")
+    pr.add_argument("logfile", nargs="+", help="sim.log (여러 개 지정 가능)")
+    pr.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                    metavar="N",
+                    help="C 엔진에서 동시 처리할 파일 수 (기본: 코어 수)")
     pr.add_argument("--engine", choices=("auto", "c", "python"), default="auto",
                     help="auto=C 우선(기본), c=C 강제, python=파이썬 강제")
-    pr.add_argument("--out", help="결과 파일 (기본: <입력>.pruned.log)")
+    pr.add_argument("--out",
+                    help="결과 파일 (기본: <입력>.pruned.log, 입력 1개일 때만)")
     pr.add_argument("--in-place", action="store_true",
                     help="임시 파일에 쓴 뒤 원본을 교체 (원자적)")
     pr.add_argument("--deposit-pairs-only", action="store_true",
