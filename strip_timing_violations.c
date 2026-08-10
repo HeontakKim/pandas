@@ -43,6 +43,10 @@
 #define MAX_LOOKAHEAD    8    /* violation 헤더 뒤로 몇 줄까지 살펴볼지 */
 #define MAX_TRAIL_BLANK  2    /* 블록 뒤 빈 줄 몇 개까지 같이 지울지 */
 
+/* 정리된 로그가 이 크기 이상이면 경고한다. timing violation 을 다 걷어냈는데도
+ * 로그가 크다는 건 로그를 키우는 다른 메시지가 있다는 뜻이다. */
+#define DEFAULT_WARN_BYTES (1ULL << 30)   /* 1 GiB */
+
 static const char HDR[]  = "Warning!";
 static const char HKEY[] = "Timing violation";
 #define HDR_LEN  8
@@ -429,11 +433,32 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+/*
+ * timing violation 을 전부 걷어냈는데도 정리된 로그가 여전히 크다면,
+ * 로그를 부풀리는 다른 메시지가 있다는 뜻이다. 그대로 두면 사용자는
+ * "왜 아직도 크지?" 하고 헤매게 되므로 무엇을 확인해야 할지까지 알려준다.
+ */
+static void warn_big_clean(const char *path, const char *size_str)
+{
+    fprintf(stderr,
+        "\n  [경고] timing violation 을 제거한 뒤에도 정리된 로그가 %s 입니다.\n"
+        "         timing violation 외에 로그를 키우는 메시지가 더 있습니다.\n"
+        "         (테스트벤치 $display/$monitor, UVM_INFO, SDF annotation 경고,\n"
+        "          assertion 메시지 등이 흔한 원인입니다)\n"
+        "         어떤 메시지가 반복되는지 앞부분만 표본으로 확인해 보세요\n"
+        "         (숫자를 # 로 바꿔 같은 종류의 메시지를 묶습니다):\n"
+        "           head -n 2000000 %s \\\n"
+        "             | sed 's/[0-9][0-9]*/#/g' | cut -c1-60 \\\n"
+        "             | sort | uniq -c | sort -rn | head -20\n",
+        size_str, path);
+}
+
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
     const char *in_path = NULL, *out_path = NULL, *agg_path = NULL;
     unsigned long long prog_lines = 1000000, prog_viol = 1000;
+    unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
     int no_progress = 0, keep_blank = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -444,6 +469,8 @@ int main(int argc, char **argv)
             prog_lines = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--progress-violations") && i + 1 < argc)
             prog_viol = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--warn-bytes") && i + 1 < argc)
+            warn_bytes = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--no-progress"))       no_progress = 1;
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
         else if (a[0] == '-' && a[1])
@@ -637,20 +664,30 @@ int main(int argc, char **argv)
 
     if (!no_progress) REPORT(1);
 
+    unsigned long long out_size = 0;
+    struct stat ost;
+    if (stat(out_path, &ost) == 0) out_size = (unsigned long long)ost.st_size;
+
     double dt = now_sec() - t0;
-    char hb[32];
+    char hb[32], ob[32];
     human((double)nbytes, hb, sizeof hb);
+    human((double)out_size, ob, sizeof ob);
     fprintf(stderr,
             "\n[strip 완료] %.1fs (%.1f MB/s)\n"
             "  입력      : %-28s %12s\n"
-            "  정리 로그 : %-28s\n"
+            "  정리 로그 : %-28s %12s\n"
             "  집계      : %-28s %zu 곳\n"
             "  violation : %llu 건  (남긴 줄 %llu)\n",
             dt, dt > 0 ? nbytes / 1e6 / dt : 0,
-            in_path, hb, out_path, agg_path, agg.uniq, nviol, kept);
+            in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
     if (unparsed)
         fprintf(stderr,
                 "  주의: 형식이 다른 violation 후보 %llu 건은 원본에 남겼습니다.\n",
                 unparsed);
+    /* warn_bytes==0 이면 경고를 끈다. 파이썬이 여러 파일을 조율할 때는
+     * 여기서 파일마다 찍으면 마지막 요약에 묻히므로, 파이썬이 맨 끝에
+     * 한 번만 모아서 출력하도록 넘긴다. */
+    if (warn_bytes > 0 && out_size >= warn_bytes)
+        warn_big_clean(out_path, ob);
     return 0;
 }

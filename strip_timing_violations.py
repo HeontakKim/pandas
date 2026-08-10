@@ -482,7 +482,10 @@ def _strip_with_c(args, exe):
     if args.keep_blank:
         cmdbase.append("--keep-blank")
     cmdbase += ["--progress-lines", str(args.progress_lines),
-                "--progress-violations", str(args.progress_violations)]
+                "--progress-violations", str(args.progress_violations),
+                "--warn-bytes", "0"]
+    # C 쪽 경고는 끈다(0). 파일마다 찍으면 마지막 요약에 묻히므로,
+    # 아래에서 파이썬이 전체를 모아 맨 끝에 한 번만 출력한다.
 
     t0 = time.time()
     par = max(1, args.jobs)
@@ -524,16 +527,18 @@ def _strip_with_c(args, exe):
                 pass
 
     total_in = sum(os.path.getsize(s) for s, _, _ in jobs)
+    outs = [d for _, d, _ in jobs]
+    total_out = sum(os.path.getsize(d) for d in outs if os.path.exists(d))
     sys.stderr.write(
         "\n[strip 완료 / C 엔진] 스캔 %.1fs (%.1f MB/s), 전체 %.1fs\n"
         "  입력      : %d개 파일 %s\n"
-        "  정리 로그 : %s\n"
+        "  정리 로그 : %-28s %s\n"
         "  요약 DB   : %-28s %s\n"
         % (scan_dt, total_in / 1e6 / scan_dt if scan_dt else 0,
            time.time() - t0,
            len(jobs), _human(total_in),
-           ", ".join(os.path.basename(d) for _, d, _ in jobs[:3])
-           + (" ..." if len(jobs) > 3 else ""),
+           ", ".join(os.path.basename(d) for d in outs[:3])
+           + (" ..." if len(outs) > 3 else ""), _human(total_out),
            args.db, _human(os.path.getsize(args.db)))
     )
     if not args.no_detail:
@@ -541,6 +546,7 @@ def _strip_with_c(args, exe):
             "  참고: C 엔진은 gzip 상세 레코드를 만들지 않습니다.\n"
             "        개별 타임스탬프까지 필요하면 --engine python 을 쓰세요.\n"
         )
+    warn_big_clean(outs, args.warn_bytes)
 
 
 def strip(args):
@@ -571,6 +577,7 @@ def strip(args):
     )
     t0 = time.time()
     tb = tl = tk = 0
+    outs = []
     try:
         for src in args.logfile:
             dst = args.out or (os.path.splitext(src)[0] + ".clean.log")
@@ -578,6 +585,7 @@ def strip(args):
                 sys.exit("error: 입력과 출력 경로가 같습니다: %s" % src)
             b, l, k = _strip_python_file(src, dst, store, args)
             tb += b; tl += l; tk += k
+            outs.append(dst)
     finally:
         store.close()
 
@@ -600,6 +608,7 @@ def strip(args):
             "  주의: 형식이 다른 violation 후보 %d 건은 원본에 그대로 남겼습니다.\n"
             % store.unparsed
         )
+    warn_big_clean(outs, args.warn_bytes)
 
 
 def _human(n):
@@ -607,6 +616,40 @@ def _human(n):
         if n < 1024 or u == "TB":
             return "%.1f %s" % (n, u)
         n /= 1024.0
+
+
+def warn_big_clean(paths, warn_bytes):
+    """
+    timing violation 을 전부 걷어냈는데도 정리된 로그가 여전히 크면 알려준다.
+    그대로 두면 "왜 아직도 크지?" 하고 헤매게 되므로, 무엇을 확인해야 할지까지
+    같이 알려준다.
+    """
+    big = []
+    for p in paths:
+        try:
+            n = os.path.getsize(p)
+        except OSError:
+            continue
+        if n >= warn_bytes:
+            big.append((p, n))
+    if not big:
+        return
+
+    sys.stderr.write(
+        "\n  [경고] timing violation 을 제거한 뒤에도 정리된 로그가 큽니다:\n")
+    for p, n in big:
+        sys.stderr.write("         %-40s %s\n" % (p, _human(n)))
+    sys.stderr.write(
+        "         timing violation 외에 로그를 키우는 메시지가 더 있습니다.\n"
+        "         (테스트벤치 $display/$monitor, UVM_INFO, SDF annotation 경고,\n"
+        "          assertion 메시지 등이 흔한 원인입니다)\n"
+        "         어떤 메시지가 반복되는지 앞부분만 표본으로 확인해 보세요\n"
+        "         (숫자를 # 로 바꿔 같은 종류의 메시지를 묶습니다):\n"
+        "           head -n 2000000 %s \\\n"
+        "             | sed 's/[0-9][0-9]*/#/g' | cut -c1-60 \\\n"
+        "             | sort | uniq -c | sort -rn | head -20\n"
+        % big[0][0]
+    )
 
 
 def _hms(sec):
@@ -705,6 +748,8 @@ def main():
     s.add_argument("--progress-violations", type=int, default=1000,
                    metavar="N", help="violation N 건마다 진행률 출력 (기본: 1000)")
     s.add_argument("--no-progress", action="store_true", help="진행률 출력 끄기")
+    s.add_argument("--warn-bytes", type=int, default=1 << 30, metavar="N",
+                   help="정리된 로그가 N 바이트 이상이면 경고 (기본: 1GiB)")
     s.set_defaults(func=strip)
 
     ld = sub.add_parser("load", help="C 판이 만든 집계 TSV 를 DB 로 적재/병합")
