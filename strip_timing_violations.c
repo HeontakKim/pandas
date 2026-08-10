@@ -497,7 +497,7 @@ int main(int argc, char **argv)
     const char *in_path = NULL, *out_path = NULL, *agg_path = NULL;
     unsigned long long prog_lines = 1000000, prog_viol = 1000;
     unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
-    int no_progress = 0, keep_blank = 0, prune_deposit = 1;
+    int no_progress = 0, keep_blank = 0, prune_deposit = 1, prune_only = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -512,6 +512,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-progress"))       no_progress = 1;
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
         else if (!strcmp(a, "--keep-deposit"))      prune_deposit = 0;
+        else if (!strcmp(a, "--prune-only"))        prune_only = 1;
         else if (a[0] == '-' && a[1])
             die("알 수 없는 옵션: %s", a);
         else if (!in_path)                          in_path = a;
@@ -572,7 +573,8 @@ int main(int argc, char **argv)
 
         /* ---- fast path: 대부분의 줄은 여기서 끝난다 ----
          * p[0] 한 바이트 비교로 대부분이 걸러지므로 memcmp/memmem 까지 가지 않는다. */
-        if (l < HDR_LEN || p[0] != 'W' || memcmp(p, HDR, HDR_LEN) != 0 ||
+        if (prune_only || l < HDR_LEN || p[0] != 'W' ||
+            memcmp(p, HDR, HDR_LEN) != 0 ||
             !memmem(p, l, HKEY, sizeof(HKEY) - 1)) {
 
             /* deposit + PNOOBJ 짝이면 두 줄을 통째로 버린다 */
@@ -721,7 +723,7 @@ int main(int argc, char **argv)
     wr_flush(&w);
     if (close(fout)) die("출력 닫기 실패");
     close(fin);
-    agg_dump(&agg, agg_path);
+    if (!prune_only) agg_dump(&agg, agg_path);   /* prune 전용이면 집계가 없다 */
 
     if (!no_progress) REPORT(1);
 
@@ -733,14 +735,22 @@ int main(int argc, char **argv)
     char hb[32], ob[32];
     human((double)nbytes, hb, sizeof hb);
     human((double)out_size, ob, sizeof ob);
-    fprintf(stderr,
-            "\n[strip 완료] %.1fs (%.1f MB/s)\n"
-            "  입력      : %-28s %12s\n"
-            "  정리 로그 : %-28s %12s\n"
-            "  집계      : %-28s %zu 곳\n"
-            "  violation : %llu 건  (남긴 줄 %llu)\n",
-            dt, dt > 0 ? nbytes / 1e6 / dt : 0,
-            in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
+    if (prune_only)
+        fprintf(stderr,
+                "\n[prune 완료] %.1fs (%.1f MB/s)\n"
+                "  입력      : %-28s %12s\n"
+                "  결과      : %-28s %12s\n",
+                dt, dt > 0 ? nbytes / 1e6 / dt : 0,
+                in_path, hb, out_path, ob);
+    else
+        fprintf(stderr,
+                "\n[strip 완료] %.1fs (%.1f MB/s)\n"
+                "  입력      : %-28s %12s\n"
+                "  정리 로그 : %-28s %12s\n"
+                "  집계      : %-28s %zu 곳\n"
+                "  violation : %llu 건  (남긴 줄 %llu)\n",
+                dt, dt > 0 ? nbytes / 1e6 / dt : 0,
+                in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
     if (npruned)
         fprintf(stderr,
                 "  deposit   : %llu 짝 (%llu 줄) 삭제 (xcelium deposit + PNOOBJ)\n",

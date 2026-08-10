@@ -654,31 +654,76 @@ def strip(args):
 #
 # Xcelium 이 존재하지 않는 계층에 deposit 을 시도하면 아래 두 줄이 짝으로 남는다.
 #
-#   xcelium> deposit top.dut.core_aaa.l2_cache.ff_0.Q
+#   xcelium> deposit top.dut.core_aaa.l2_cache.ff_0.Q 0
 #   xmsim: *SE,PNOOBJ: Path element could not be found: l2_cache.
 #
 # 계층 이름만 매번 달라서 줄 단위로는 전부 다른 문자열이지만, 형태는 같다.
 # timing violation 과 달리 남겨둘 정보가 없으므로 그냥 지운다.
 #
-# 반드시 '짝'으로만 지운다. deposit 이 성공하면 뒤에 에러 줄이 붙지 않는데,
-# 그런 성공한 deposit 까지 지워버리면 실제 정보가 사라지기 때문이다.
+# deposit 줄은 '프롬프트 + deposit + 인자 하나 이상' 까지만 확인한다.
+# 인자의 개수나 형태(계층만, 계층+값 0, 1'b0, = 붙은 형태 ...)는 보지 않는다.
+# 시뮬레이터/스크립트마다 다르고, 거기에 맞춰 정규식을 조이면 형태가 조금만
+# 달라져도 조용히 매칭에 실패해서 아무것도 지워지지 않기 때문이다.
+# (C 판 is_deposit_cmd() 와 같은 규칙이다. 두 엔진이 어긋나면 안 된다.)
+#
+# 안전장치는 정규식이 아니라 '짝' 조건이다. 다음 줄이 PNOOBJ 에러일 때만
+# 둘 다 지운다. deposit 이 성공하면 뒤에 에러 줄이 붙지 않으므로,
+# 성공한 deposit 은 어떤 형태이든 그대로 살아남는다.
 # ---------------------------------------------------------------------------
 PRUNE_P1_PREFIX = b"xcelium>"
 PRUNE_P2_PREFIX = b"xmsim:"
-RE_DEPOSIT = re.compile(rb"^xcelium>\s*deposit\s+\S+\s*$")
+RE_DEPOSIT = re.compile(rb"^xcelium>\s*deposit\s+\S")
 RE_PNOOBJ = re.compile(
     rb"^xmsim:\s*\*SE,PNOOBJ:\s*Path element could not be found:")
 
 
-def prune(args):
-    """deposit/PNOOBJ 짝을 지운다. 1패스 스트리밍이라 파일 크기와 무관하다."""
+def _prune_dst(args):
     src = args.logfile
     if args.in_place:
-        dst = src + ".prune.tmp"
+        return src + ".prune.tmp"
+    dst = args.out or (os.path.splitext(src)[0] + ".pruned.log")
+    if os.path.abspath(src) == os.path.abspath(dst):
+        sys.exit("error: 입력과 출력 경로가 같습니다. --out 을 지정하세요.")
+    return dst
+
+
+def _prune_with_c(args, exe):
+    """C 의 --prune-only 모드로 처리한다. strip 과 같은 엔진을 쓴다."""
+    src = args.logfile
+    # dry-run 은 /dev/null 로 흘려보내면 개수만 세는 것과 같다.
+    dst = os.devnull if args.dry_run else _prune_dst(args)
+
+    cmd = [exe, src, "-o", dst, "--prune-only", "--warn-bytes", "0"]
+    if args.no_progress:
+        cmd.append("--no-progress")
     else:
-        dst = args.out or (os.path.splitext(src)[0] + ".pruned.log")
-        if os.path.abspath(src) == os.path.abspath(dst):
-            sys.exit("error: 입력과 출력 경로가 같습니다. --out 을 지정하세요.")
+        cmd += ["--progress-lines", str(args.progress_lines)]
+
+    if subprocess.run(cmd).returncode != 0:
+        sys.exit("error: C 엔진 prune 실패: %s" % src)
+
+    if args.dry_run:
+        sys.stderr.write("  (--dry-run: 파일을 만들지 않았습니다)\n")
+        return
+    if args.in_place:
+        os.replace(dst, src)      # 같은 파일시스템이면 원자적으로 교체된다
+        sys.stderr.write("  원본을 교체했습니다: %s\n" % src)
+
+
+def prune(args):
+    """deposit/PNOOBJ 짝을 지운다. 1패스 스트리밍이라 파일 크기와 무관하다."""
+    exe = None
+    if args.engine in ("auto", "c"):
+        exe = find_or_build_c(quiet=args.no_progress)
+        if exe is None and args.engine == "c":
+            sys.exit("error: C 엔진을 쓸 수 없습니다 (컴파일러 또는 %s 없음)" % C_SRC)
+    if exe is not None:
+        return _prune_with_c(args, exe)
+    if args.engine == "auto":
+        sys.stderr.write("[안내] C 엔진을 쓸 수 없어 파이썬으로 처리합니다.\n")
+
+    src = args.logfile
+    dst = _prune_dst(args)
 
     n = nbytes = nline = 0
     total = os.path.getsize(src)
@@ -909,6 +954,8 @@ def main():
     pr = sub.add_parser(
         "prune", help="반복되는 deposit/PNOOBJ 잡음 두 줄짜리 짝을 삭제 (DB 없음)")
     pr.add_argument("logfile")
+    pr.add_argument("--engine", choices=("auto", "c", "python"), default="auto",
+                    help="auto=C 우선(기본), c=C 강제, python=파이썬 강제")
     pr.add_argument("--out", help="결과 파일 (기본: <입력>.pruned.log)")
     pr.add_argument("--in-place", action="store_true",
                     help="임시 파일에 쓴 뒤 원본을 교체 (원자적)")
