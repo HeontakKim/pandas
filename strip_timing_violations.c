@@ -4,6 +4,14 @@
  * strip_timing_violations.py 의 C 구현. 10GB 급 로그 파일 다수를 처리하기 위한
  * 버전이다. 파이썬판과 동일한 결과(정리된 로그 + scope 집계)를 낸다.
  *
+ * 한 번의 pass 에서 두 가지를 지운다:
+ *   - Timing violation 블록 (5줄) -> scope 별로 집계해 TSV 로 내보낸다
+ *   - xcelium deposit + PNOOBJ 짝 (2줄) -> 남길 정보가 없어 그냥 버린다
+ *     (--keep-deposit 로 끌 수 있다)
+ *
+ * 둘을 같은 pass 에서 처리하는 게 핵심이다. 따로 돌리면 10GB 를 한 번 더
+ * 읽고 써야 하지만, 여기에 넣으면 줄마다 바이트 비교 한 번이 늘 뿐이다.
+ *
  * 설계 원칙:
  *   - libc 외 의존성 없음. zlib/sqlite3 링크 안 함 -> Termux/proot 에서 그냥 빌드된다.
  *   - 줄 단위 할당 없음. 읽기 버퍼 안에서 포인터로만 다룬다.
@@ -352,6 +360,36 @@ static inline int is_blank(const unsigned char *p, size_t n)
     return 1;
 }
 
+/*
+ * Xcelium 이 없는 계층에 deposit 을 시도하면 아래 두 줄이 짝으로 남는다.
+ *
+ *   xcelium> deposit top.dut.core_aaa.l2_cache.ff_0.Q
+ *   xmsim: *SE,PNOOBJ: Path element could not be found: l2_cache.
+ *
+ * 계층 이름만 매번 달라 줄 단위로는 전부 다른 문자열이지만 형태는 같다.
+ * 남겨둘 정보가 없으므로 그냥 버린다. 단 반드시 '짝'일 때만 버린다 —
+ * 성공한 deposit 은 뒤에 에러 줄이 붙지 않는데, 그것까지 지우면
+ * 실제로 무엇을 deposit 했는지가 사라지기 때문이다.
+ */
+static int is_deposit_cmd(const unsigned char *p, size_t n)
+{
+    if (n < 16 || memcmp(p, "xcelium>", 8) != 0) return 0;
+    const unsigned char *q = p + 8, *end = p + n;
+    while (q < end && (*q == ' ' || *q == '\t')) q++;
+    if ((size_t)(end - q) < 8 || memcmp(q, "deposit", 7) != 0) return 0;
+    q += 7;
+    if (q >= end || (*q != ' ' && *q != '\t')) return 0;
+    while (q < end && (*q == ' ' || *q == '\t')) q++;
+    return q < end && *q != '\n' && *q != '\r';   /* 인자가 있어야 한다 */
+}
+
+static int is_pnoobj_err(const unsigned char *p, size_t n)
+{
+    if (n < 6 || memcmp(p, "xmsim:", 6) != 0) return 0;
+    return memmem(p, n, "PNOOBJ", 6) != NULL &&
+           memmem(p, n, "could not be found:", 19) != NULL;
+}
+
 static inline int is_header(const unsigned char *p, size_t n)
 {
     return n >= HDR_LEN && memcmp(p, HDR, HDR_LEN) == 0 &&
@@ -459,7 +497,7 @@ int main(int argc, char **argv)
     const char *in_path = NULL, *out_path = NULL, *agg_path = NULL;
     unsigned long long prog_lines = 1000000, prog_viol = 1000;
     unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
-    int no_progress = 0, keep_blank = 0;
+    int no_progress = 0, keep_blank = 0, prune_deposit = 1;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -473,6 +511,7 @@ int main(int argc, char **argv)
             warn_bytes = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--no-progress"))       no_progress = 1;
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
+        else if (!strcmp(a, "--keep-deposit"))      prune_deposit = 0;
         else if (a[0] == '-' && a[1])
             die("알 수 없는 옵션: %s", a);
         else if (!in_path)                          in_path = a;
@@ -502,6 +541,7 @@ int main(int argc, char **argv)
     Agg agg;  agg_init(&agg);
 
     unsigned long long nline = 0, nviol = 0, kept = 0, unparsed = 0;
+    unsigned long long npruned = 0;
     unsigned long long nbytes = 0;
     unsigned long long line_mark = prog_lines, viol_mark = prog_viol;
     double t0 = now_sec();
@@ -530,9 +570,30 @@ int main(int argc, char **argv)
     while (rd_line(&r, &p, &l)) {
         nline++; nbytes += l;
 
-        /* ---- fast path: 대부분의 줄은 여기서 끝난다 ---- */
-        if (l < HDR_LEN || memcmp(p, HDR, HDR_LEN) != 0 ||
+        /* ---- fast path: 대부분의 줄은 여기서 끝난다 ----
+         * p[0] 한 바이트 비교로 대부분이 걸러지므로 memcmp/memmem 까지 가지 않는다. */
+        if (l < HDR_LEN || p[0] != 'W' || memcmp(p, HDR, HDR_LEN) != 0 ||
             !memmem(p, l, HKEY, sizeof(HKEY) - 1)) {
+
+            /* deposit + PNOOBJ 짝이면 두 줄을 통째로 버린다 */
+            if (prune_deposit && p[0] == 'x' && is_deposit_cmd(p, l)) {
+                unsigned char *q;
+                size_t ql;
+                if (rd_line(&r, &q, &ql)) {
+                    if (is_pnoobj_err(q, ql)) {
+                        nbytes += ql;       /* 소비했으므로 센다 */
+                        nline++;
+                        npruned++;
+                        if (!no_progress && nline >= line_mark) {
+                            line_mark += prog_lines;
+                            REPORT(0);
+                        }
+                        continue;
+                    }
+                    rd_unget(&r, ql);       /* 짝이 아니다 -> 되돌린다(세지 않음) */
+                }
+            }
+
             wr_put(&w, p, l);
             kept++;
             if (!no_progress && nline >= line_mark) {
@@ -680,6 +741,10 @@ int main(int argc, char **argv)
             "  violation : %llu 건  (남긴 줄 %llu)\n",
             dt, dt > 0 ? nbytes / 1e6 / dt : 0,
             in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
+    if (npruned)
+        fprintf(stderr,
+                "  deposit   : %llu 짝 (%llu 줄) 삭제 (xcelium deposit + PNOOBJ)\n",
+                npruned, npruned * 2);
     if (unparsed)
         fprintf(stderr,
                 "  주의: 형식이 다른 violation 후보 %llu 건은 원본에 남겼습니다.\n",

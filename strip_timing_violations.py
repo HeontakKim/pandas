@@ -3,17 +3,24 @@
 """
 strip_timing_violations.py
 
-SDF annotation 시뮬레이션 로그(sim.log)에서 Timing violation 블록을 제거하고,
-그 정보를 압축/색인된 형태로 따로 저장한다.
+SDF annotation 시뮬레이션 로그(sim.log)를 정리하고, 지워진 정보를 검색 가능한
+형태로 남긴다. 한 번의 streaming pass 로 아래를 모두 처리한다.
 
-동작 (한 번의 streaming pass로 모두 처리):
-  1) sim.log  ->  sim.clean.log        : timing violation 블록이 제거된 로그
-  2)            ->  violations.tsv.gz  : 전체 violation 원본 레코드 (gzip, 무손실)
-  3)            ->  violations.db      : Scope 로 색인된 SQLite 요약 DB (집계 = 압축)
+  - Timing violation 블록(5줄) 제거 -> scope 별로 집계해서 DB 에 보관
+  - 반복되는 xcelium deposit + PNOOBJ 짝(2줄) 제거 -> 남길 정보가 없어 그냥 버림
+
+산출물:
+  sim.clean.log       정리된 로그
+  violations.db       Scope 로 색인된 SQLite 요약 (집계가 곧 압축: 약 1/10000)
+  violations.tsv.gz   전체 violation 원본 레코드 (--engine python 일 때만)
+
+무거운 스캔은 C 판(strip_timing_violations.c)이 맡는다. strip 이 알아서 빌드해
+쓰고, 컴파일러가 없으면 파이썬으로 넘어간다. 파이썬 27MB/s vs C 379MB/s.
 
 사용법:
-  # 추출
+  # 정리 (C 자동 빌드 + 실행 + DB 적재까지 한 번에)
   python3 strip_timing_violations.py strip sim.log
+  python3 strip_timing_violations.py strip *.log        # 코어 수만큼 병렬, DB 병합
 
   # Scope 검색 (하위 계층까지 포함)
   python3 strip_timing_violations.py query top.dut.core_a
@@ -21,8 +28,11 @@ SDF annotation 시뮬레이션 로그(sim.log)에서 Timing violation 블록을 
   python3 strip_timing_violations.py query top.dut --detail
   python3 strip_timing_violations.py top-scopes -n 20
 
+  # deposit 잡음만 지우기 (timing violation 은 건드리지 않음)
+  python3 strip_timing_violations.py prune sim.log --in-place
+
 메모리 사용량은 입력 파일 크기와 무관하며(스트리밍 + 주기적 flush),
-2GB 이상의 로그도 상수 메모리로 처리한다.
+10GB 이상의 로그도 상수 메모리로 처리한다.
 """
 
 import argparse
@@ -209,6 +219,7 @@ class ViolationStore:
         self.pending = {}  # key -> [count, min_fs, max_fs]
         self.total = 0
         self.unparsed = 0
+        self.pruned = 0
 
         if keep_detail:
             if os.path.exists(detail_path):
@@ -309,6 +320,7 @@ def _strip_python_file(src, dst, store, args):
     # 임계값에 도달했을 때만 report() 를 부른다. 비활성화 시 inf 를 넣어두면
     # 루프 안에 별도의 'if enabled' 분기를 두지 않아도 된다.
     INF = float("inf")
+    prune_dep = not getattr(args, "keep_deposit", False)
     every_line = INF if args.no_progress else args.progress_lines
     every_viol = INF if args.no_progress else args.progress_violations
     line_mark = every_line
@@ -329,6 +341,25 @@ def _strip_python_file(src, dst, store, args):
             # 전체 줄의 99% 이상은 violation 이 아니다. bytes slice 비교는
             # C 레벨이라 여기서 대부분의 줄이 즉시 통과한다.
             if line[:8] != HEADER_PREFIX or HEADER_KEY not in line:
+
+                # deposit + PNOOBJ 짝이면 두 줄을 통째로 버린다
+                if prune_dep and line[:8] == PRUNE_P1_PREFIX \
+                        and RE_DEPOSIT.match(line):
+                    nl2 = nxt()
+                    if nl2:
+                        if nl2[:6] == PRUNE_P2_PREFIX and RE_PNOOBJ.match(nl2):
+                            nbytes += len(nl2)
+                            nline += 1
+                            store.pruned += 1
+                            line = nxt()
+                            continue
+                        write(line)
+                        kept += 1
+                        # 짝이 아니다 -> 다음 줄을 새로 판정한다.
+                        # 세는 건 루프 상단이 하므로 여기서 세면 이중 계산이 된다.
+                        line = nl2
+                        continue
+
                 write(line)
                 kept += 1
                 if nline >= line_mark:          # 나눗셈(%)보다 비교가 싸다
@@ -481,6 +512,8 @@ def _strip_with_c(args, exe):
         cmdbase.append("--no-progress")
     if args.keep_blank:
         cmdbase.append("--keep-blank")
+    if args.keep_deposit:
+        cmdbase.append("--keep-deposit")
     cmdbase += ["--progress-lines", str(args.progress_lines),
                 "--progress-violations", str(args.progress_violations),
                 "--warn-bytes", "0"]
@@ -603,12 +636,131 @@ def strip(args):
            _human(os.path.getsize(args.detail)) if not args.no_detail else "-",
            format(store.total, ","), format(tk, ","))
     )
+    if store.pruned:
+        sys.stderr.write(
+            "  deposit   : %s 짝 (%s 줄) 삭제 (xcelium deposit + PNOOBJ)\n"
+            % (format(store.pruned, ","), format(store.pruned * 2, ","))
+        )
     if store.unparsed:
         sys.stderr.write(
             "  주의: 형식이 다른 violation 후보 %d 건은 원본에 그대로 남겼습니다.\n"
             % store.unparsed
         )
     warn_big_clean(outs, args.warn_bytes)
+
+
+# ---------------------------------------------------------------------------
+# 반복되는 잡음 메시지 제거 (prune)
+#
+# Xcelium 이 존재하지 않는 계층에 deposit 을 시도하면 아래 두 줄이 짝으로 남는다.
+#
+#   xcelium> deposit top.dut.core_aaa.l2_cache.ff_0.Q
+#   xmsim: *SE,PNOOBJ: Path element could not be found: l2_cache.
+#
+# 계층 이름만 매번 달라서 줄 단위로는 전부 다른 문자열이지만, 형태는 같다.
+# timing violation 과 달리 남겨둘 정보가 없으므로 그냥 지운다.
+#
+# 반드시 '짝'으로만 지운다. deposit 이 성공하면 뒤에 에러 줄이 붙지 않는데,
+# 그런 성공한 deposit 까지 지워버리면 실제 정보가 사라지기 때문이다.
+# ---------------------------------------------------------------------------
+PRUNE_P1_PREFIX = b"xcelium>"
+PRUNE_P2_PREFIX = b"xmsim:"
+RE_DEPOSIT = re.compile(rb"^xcelium>\s*deposit\s+\S+\s*$")
+RE_PNOOBJ = re.compile(
+    rb"^xmsim:\s*\*SE,PNOOBJ:\s*Path element could not be found:")
+
+
+def prune(args):
+    """deposit/PNOOBJ 짝을 지운다. 1패스 스트리밍이라 파일 크기와 무관하다."""
+    src = args.logfile
+    if args.in_place:
+        dst = src + ".prune.tmp"
+    else:
+        dst = args.out or (os.path.splitext(src)[0] + ".pruned.log")
+        if os.path.abspath(src) == os.path.abspath(dst):
+            sys.exit("error: 입력과 출력 경로가 같습니다. --out 을 지정하세요.")
+
+    n = nbytes = nline = 0
+    total = os.path.getsize(src)
+    t0 = time.time()
+    eol = "\r" if sys.stderr.isatty() else "\n"
+    mark = args.progress_lines if not args.no_progress else float("inf")
+
+    def report(final=False):
+        el = time.time() - t0
+        sys.stderr.write(
+            "[prune] %5.1f%% %13s lines %9s 짝 %9s %6.1f MB/s   %s"
+            % (nbytes * 100.0 / total if total else 0.0,
+               format(nline, ","), format(n, ","), _human(nbytes),
+               (nbytes / el if el else 0) / 1e6, "\n" if final else eol))
+        sys.stderr.flush()
+
+    fin = open(src, "rb", buffering=IO_BUF)
+    fout = None if args.dry_run else open(dst, "wb", buffering=IO_BUF)
+    nxt = fin.readline
+    write = fout.write if fout is not None else None
+    try:
+        line = nxt()
+        while line:
+            nbytes += len(line)
+            nline += 1
+
+            # fast path: 대부분의 줄은 8바이트 비교 한 번으로 통과한다
+            if line[:8] != PRUNE_P1_PREFIX or not RE_DEPOSIT.match(line):
+                if write is not None:
+                    write(line)
+                if nline >= mark:
+                    mark += args.progress_lines
+                    report()
+                line = nxt()
+                continue
+
+            nxt_line = nxt()
+            if not nxt_line:
+                if write is not None:
+                    write(line)
+                break
+
+            if nxt_line[:6] == PRUNE_P2_PREFIX and RE_PNOOBJ.match(nxt_line):
+                nbytes += len(nxt_line)
+                nline += 1
+                n += 1
+                line = nxt()          # 짝을 통째로 버린다
+                continue
+
+            # 짝이 아니다 -> deposit 줄은 살리고, 다음 줄을 새로 판정한다
+            if write is not None:
+                write(line)
+            line = nxt_line
+    finally:
+        fin.close()
+        if fout is not None:
+            fout.close()
+
+    if not args.no_progress:
+        report(final=True)
+
+    if args.dry_run:
+        sys.stderr.write("\n[prune / dry-run] deposit/PNOOBJ %s 짝 (%s 줄) 발견. "
+                         "파일은 만들지 않았습니다.\n"
+                         % (format(n, ","), format(n * 2, ",")))
+        return
+
+    if args.in_place:
+        os.replace(dst, src)          # 같은 파일시스템이면 원자적으로 교체된다
+        final_path = src
+    else:
+        final_path = dst
+
+    out_size = os.path.getsize(final_path)
+    sys.stderr.write(
+        "\n[prune 완료] %.1fs\n"
+        "  입력      : %-28s %12s\n"
+        "  결과      : %-28s %12s\n"
+        "  제거      : %s 짝 (%s 줄)  %s 절감\n"
+        % (time.time() - t0, src, _human(nbytes), final_path, _human(out_size),
+           format(n, ","), format(n * 2, ","), _human(nbytes - out_size))
+    )
 
 
 def _human(n):
@@ -743,6 +895,8 @@ def main():
                    help="gzip 압축 레벨 1(빠름)~9(작음), 기본 6")
     s.add_argument("--keep-blank", action="store_true",
                    help="violation 블록 뒤의 빈 줄을 지우지 않음")
+    s.add_argument("--keep-deposit", action="store_true",
+                   help="반복되는 xcelium deposit + PNOOBJ 짝을 지우지 않음")
     s.add_argument("--progress-lines", type=int, default=1_000_000,
                    metavar="N", help="N 줄마다 진행률 출력 (기본: 1000000)")
     s.add_argument("--progress-violations", type=int, default=1000,
@@ -751,6 +905,19 @@ def main():
     s.add_argument("--warn-bytes", type=int, default=1 << 30, metavar="N",
                    help="정리된 로그가 N 바이트 이상이면 경고 (기본: 1GiB)")
     s.set_defaults(func=strip)
+
+    pr = sub.add_parser(
+        "prune", help="반복되는 deposit/PNOOBJ 잡음 두 줄짜리 짝을 삭제 (DB 없음)")
+    pr.add_argument("logfile")
+    pr.add_argument("--out", help="결과 파일 (기본: <입력>.pruned.log)")
+    pr.add_argument("--in-place", action="store_true",
+                    help="임시 파일에 쓴 뒤 원본을 교체 (원자적)")
+    pr.add_argument("--dry-run", action="store_true",
+                    help="개수만 세고 파일은 만들지 않음")
+    pr.add_argument("--progress-lines", type=int, default=1_000_000, metavar="N",
+                    help="N 줄마다 진행률 출력 (기본: 1000000)")
+    pr.add_argument("--no-progress", action="store_true", help="진행률 출력 끄기")
+    pr.set_defaults(func=prune)
 
     ld = sub.add_parser("load", help="C 판이 만든 집계 TSV 를 DB 로 적재/병합")
     ld.add_argument("aggfile", nargs="+", help="집계 TSV (여러 개 지정 시 병합)")
