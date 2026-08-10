@@ -709,8 +709,20 @@ def _prune_dst(args, src):
     return dst
 
 
+def check_inputs(paths):
+    """입력이 전부 읽을 수 있는 일반 파일인지 먼저 확인한다."""
+    for p in paths:
+        if not os.path.exists(p):
+            sys.exit("error: 파일이 없습니다: %s" % p)
+        if not os.path.isfile(p):
+            sys.exit("error: 일반 파일이 아닙니다: %s" % p)
+        if not os.access(p, os.R_OK):
+            sys.exit("error: 읽을 수 없습니다: %s" % p)
+
+
 def _prune_with_c(args, exe):
     """C 의 --prune-only 모드로 처리한다. strip 과 같은 엔진을 쓴다."""
+    check_inputs(args.logfile)
     jobs = [(src, _prune_dst(args, src)) for src in args.logfile]
     # --in-place 는 원본을 덮어쓰므로 입력 크기를 미리 재둬야 한다.
     total_in = sum(os.path.getsize(s) for s, _ in jobs)
@@ -728,25 +740,67 @@ def _prune_with_c(args, exe):
     running = []
     pending = list(jobs)
     failed = []
+    done = 0
+    # 아직 제자리를 못 찾은 산출물. 중간에 실패하거나 Ctrl-C 로 끊겨도
+    # 여기 남은 것들을 지워서 .prune.tmp 찌꺼기가 남지 않게 한다.
+    orphan = set()
 
-    # 파일 여러 개를 코어 수만큼 동시에 돌린다.
-    while pending or running:
-        while pending and len(running) < par:
-            src, dst = pending.pop(0)
-            running.append((subprocess.Popen(base + [src, "-o", dst]), src, dst))
-        p, src, dst = running.pop(0)
-        if p.wait() != 0:
-            failed.append(src)
+    try:
+        # 파일 여러 개를 코어 수만큼 동시에 돌린다.
+        while pending or running:
+            while pending and len(running) < par:
+                src, dst = pending.pop(0)
+                orphan.add(dst)
+                running.append(
+                    (subprocess.Popen(base + [src, "-o", dst]), src, dst))
+            # running 에 남겨둔 채로 기다린다. 미리 pop 하면 대기 중에
+            # Ctrl-C 가 들어왔을 때 이 프로세스만 종료 대상에서 빠져서,
+            # 파이썬이 끝난 뒤에도 혼자 계속 도는 고아 프로세스가 된다.
+            p, src, dst = running[0]
+            rc = p.wait()
+            running.pop(0)
+            if rc != 0:
+                failed.append(src)
+                continue          # 실패한 산출물은 orphan 에 남겨 지운다
+            done += 1
+            if args.dry_run:
+                orphan.discard(dst)          # /dev/null
+            elif args.in_place:
+                # 끝나는 즉시 교체한다. 마지막에 몰아서 하면 모든 임시 파일이
+                # 동시에 존재해서, 10GB 짜리가 여러 개면 그만큼 여유 공간이
+                # 더 필요해진다.
+                os.replace(dst, src)         # 같은 파일시스템이면 원자적
+                orphan.discard(dst)
+            else:
+                orphan.discard(dst)          # 사용자가 원한 출력이므로 남긴다
+    finally:
+        # Ctrl-C 등으로 빠져나온 경우: 자식을 확실히 죽인 뒤에 정리한다.
+        # 죽기 전에 파일을 지우면 남은 자식이 계속 써대며 디스크를 먹는다.
+        for p, _, _ in running:
+            if p.poll() is None:
+                p.terminate()
+        for p, _, _ in running:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        for path in orphan:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     if failed:
-        sys.exit("error: C 엔진 prune 실패: %s" % ", ".join(failed))
+        sys.exit("error: C 엔진 prune 실패: %s\n"
+                 "       (실패한 파일의 산출물은 지웠습니다. "
+                 "성공한 %d개는 그대로 반영되었습니다.)"
+                 % (", ".join(failed), done))
 
     if args.dry_run:
         sys.stderr.write("\n  (--dry-run: 파일을 만들지 않았습니다)\n")
         return
     if args.in_place:
-        for src, dst in jobs:
-            os.replace(dst, src)   # 같은 파일시스템이면 원자적으로 교체된다
         sys.stderr.write("\n  원본 %d개를 교체했습니다.\n" % len(jobs))
 
     if len(jobs) > 1:
@@ -772,11 +826,22 @@ def prune(args):
     if args.engine == "auto":
         sys.stderr.write("[안내] C 엔진을 쓸 수 없어 파이썬으로 처리합니다.\n")
 
+    check_inputs(args.logfile)
     t_all = time.time()
     tot_in = tot_out = tot_dep = tot_err = 0
     for src in args.logfile:
-        d_in, d_out, d_dep, d_err = _prune_python_file(src, _prune_dst(args, src),
-                                                       args)
+        dst = _prune_dst(args, src)
+        try:
+            d_in, d_out, d_dep, d_err = _prune_python_file(src, dst, args)
+        except BaseException:
+            # 중간에 끊기면 반쯤 쓰인 산출물이 남는다. 특히 .prune.tmp 는
+            # 순전히 내부용이라 남겨둘 이유가 없다.
+            if not args.dry_run and os.path.exists(dst):
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+            raise
         tot_in += d_in; tot_out += d_out
         tot_dep += d_dep; tot_err += d_err
 
