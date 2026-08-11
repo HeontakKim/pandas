@@ -6,8 +6,11 @@
  *
  * 한 번의 pass 에서 두 가지를 지운다:
  *   - Timing violation 블록 (5줄) -> scope 별로 집계해 TSV 로 내보낸다
- *   - xcelium deposit 줄과 PNOOBJ 에러 줄 -> 남길 정보가 없어 그냥 버린다
- *     (--keep-deposit 로 끄고, --deposit-pairs-only 로 짝일 때만 지운다)
+ *   - xcelium deposit 줄과 PNOOBJ 에러 줄 -> --prune-deposit 을 줬을 때만 지운다
+ *     (--prune-only 모드에서는 기본으로 켜짐, --deposit-pairs-only 로 짝일 때만)
+ *   - 사용자 정규식(POSIX ERE) 규칙
+ *       --drop RE            걸리는 줄을 지운다 (여러 번 지정 가능)
+ *       --drop-pair RE1 RE2  RE1 줄 바로 뒤에 RE2 줄이 올 때만 두 줄을 지운다
  *
  * 둘을 같은 pass 에서 처리하는 게 핵심이다. 따로 돌리면 10GB 를 한 번 더
  * 읽고 써야 하지만, 여기에 넣으면 줄마다 바이트 비교 한 번이 늘 뿐이다.
@@ -33,6 +36,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <regex.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -371,6 +375,80 @@ static inline int is_blank(const unsigned char *p, size_t n)
  * 성공한 deposit 은 뒤에 에러 줄이 붙지 않는데, 그것까지 지우면
  * 실제로 무엇을 deposit 했는지가 사라지기 때문이다.
  */
+/* ------------------------------------------------------------------ */
+/* 사용자 정의 정규식 규칙                                              */
+/*                                                                      */
+/* POSIX 확장 정규식(ERE)을 쓴다. 파이썬 re 와 문법이 완전히 같지는      */
+/* 않으므로(\d, lookahead 등은 ERE 에 없다) 두 엔진에서 같은 결과를      */
+/* 얻으려면 ERE 범위 안에서 써야 한다.                                  */
+/*                                                                      */
+/* 줄마다 regexec 을 돌리면 10GB 에서 너무 느리다. 그래서 '^리터럴'      */
+/* 형태로 시작하는 패턴은 접두사를 뽑아 두고 memcmp 로 먼저 걸러낸다.    */
+/* 로그 패턴은 대개 앵커가 붙으므로(^xcelium> 처럼) 이 한 수로 대부분의  */
+/* 줄이 정규식 엔진에 닿지 않는다.                                      */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    regex_t            re;
+    char               lit[32];   /* '^' 뒤의 리터럴 접두사 */
+    size_t             litlen;
+    int                litonly;   /* 패턴 전체가 ^리터럴 이면 1 */
+    unsigned long long hits;
+    const char        *src;
+} Pat;
+
+static char  *pat_scratch;        /* NUL 종료가 필요할 때 쓰는 재사용 버퍼 */
+static size_t pat_scratch_cap;
+
+static void pat_compile(Pat *pt, const char *src)
+{
+    int rc = regcomp(&pt->re, src, REG_EXTENDED | REG_NOSUB | REG_NEWLINE);
+    if (rc != 0) {
+        char eb[256];
+        regerror(rc, &pt->re, eb, sizeof eb);
+        die("정규식이 잘못되었습니다: %s (%s)", src, eb);
+    }
+    pt->hits = 0;
+    pt->src = src;
+    pt->litlen = 0;
+    pt->litonly = 0;
+
+    /* '^' 뒤로 이어지는 평범한 글자만 접두사로 뽑는다 */
+    if (src[0] == '^') {
+        const char *q = src + 1;
+        while (*q && pt->litlen < sizeof pt->lit - 1 &&
+               !strchr(".[]()*+?{}|\\^$", *q))
+            pt->lit[pt->litlen++] = *q++;
+        /* 뒤에 수량자가 붙으면 마지막 글자는 접두사가 아니다: ^abc* */
+        if (pt->litlen && *q && strchr("*?{", *q))
+            pt->litlen--;
+        /* 패턴이 ^리터럴 로 끝나면 memcmp 일치가 곧 전체 일치다.
+         * 정규식 엔진을 부를 필요가 없어 이 흔한 경우가 거의 공짜가 된다. */
+        else if (*q == '\0' && pt->litlen)
+            pt->litonly = 1;
+    }
+}
+
+static int pat_match(Pat *pt, const unsigned char *p, size_t n)
+{
+    if (pt->litlen) {
+        if (n < pt->litlen || memcmp(p, pt->lit, pt->litlen) != 0)
+            return 0;
+        if (pt->litonly) return 1;    /* 정규식 엔진 생략 */
+    }
+    while (n && (p[n - 1] == '\n' || p[n - 1] == '\r')) n--;
+
+    if (n + 1 > pat_scratch_cap) {
+        size_t cap = n + 1 < 4096 ? 4096 : n + 1;
+        char *nb = realloc(pat_scratch, cap);
+        if (!nb) die("메모리 부족 (정규식 버퍼)");
+        pat_scratch = nb;
+        pat_scratch_cap = cap;
+    }
+    memcpy(pat_scratch, p, n);
+    pat_scratch[n] = '\0';
+    return regexec(&pt->re, pat_scratch, 0, NULL, 0) == 0;
+}
+
 static int is_deposit_cmd(const unsigned char *p, size_t n)
 {
     if (n < 16 || memcmp(p, "xcelium>", 8) != 0) return 0;
@@ -497,7 +575,15 @@ int main(int argc, char **argv)
     const char *in_path = NULL, *out_path = NULL, *agg_path = NULL;
     unsigned long long prog_lines = 1000000, prog_viol = 1000;
     unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
-    int no_progress = 0, keep_blank = 0, prune_deposit = 1, prune_only = 0;
+    int no_progress = 0, keep_blank = 0, prune_only = 0;
+    int prune_deposit = -1;   /* -1 = 지정 안 됨. 아래에서 모드별 기본값을 정한다 */
+
+    /* 사용자 정규식 규칙 (개수가 적으므로 argc 만큼 넉넉히 잡는다) */
+    Pat *drops = calloc((size_t)argc + 1, sizeof(Pat));
+    Pat *pairA = calloc((size_t)argc + 1, sizeof(Pat));
+    Pat *pairB = calloc((size_t)argc + 1, sizeof(Pat));
+    if (!drops || !pairA || !pairB) die("메모리 부족");
+    size_t ndrop = 0, npair = 0;
     int pairs_only = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -513,6 +599,14 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-progress"))       no_progress = 1;
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
         else if (!strcmp(a, "--keep-deposit"))      prune_deposit = 0;
+        else if (!strcmp(a, "--prune-deposit"))     prune_deposit = 1;
+        else if (!strcmp(a, "--drop") && i + 1 < argc)
+            pat_compile(&drops[ndrop++], argv[++i]);
+        else if (!strcmp(a, "--drop-pair") && i + 2 < argc) {
+            pat_compile(&pairA[npair], argv[i + 1]);
+            pat_compile(&pairB[npair], argv[i + 2]);
+            npair++; i += 2;
+        }
         else if (!strcmp(a, "--prune-only"))        prune_only = 1;
         else if (!strcmp(a, "--deposit-pairs-only")) pairs_only = 1;
         else if (a[0] == '-' && a[1])
@@ -522,6 +616,12 @@ int main(int argc, char **argv)
     }
     if (!in_path)
         die("사용법: %s <sim.log> -o <clean.log> -a <agg.tsv> [--no-progress]", argv[0]);
+
+    /* deposit 제거 기본값은 모드에 따라 다르다.
+     * 일반 strip 은 timing violation 만 지우는 게 기본이고, deposit 까지
+     * 지우려면 --prune-deposit 을 명시해야 한다. 반면 --prune-only 는
+     * deposit 을 지우는 게 존재 이유라서 켜져 있는 게 기본이다. */
+    if (prune_deposit < 0) prune_deposit = prune_only ? 1 : 0;
 
     char defo[4096], defa[4096];
     if (!out_path) { snprintf(defo, sizeof defo, "%s.clean", in_path); out_path = defo; }
@@ -544,7 +644,7 @@ int main(int argc, char **argv)
     Agg agg;  agg_init(&agg);
 
     unsigned long long nline = 0, nviol = 0, kept = 0, unparsed = 0;
-    unsigned long long ndep = 0, nerr = 0;
+    unsigned long long ndep = 0, nerr = 0, nuser = 0;
     unsigned long long nbytes = 0;
     unsigned long long line_mark = prog_lines, viol_mark = prog_viol;
     double t0 = now_sec();
@@ -589,6 +689,35 @@ int main(int argc, char **argv)
         if (prune_only || l < HDR_LEN || p[0] != 'W' ||
             memcmp(p, HDR, HDR_LEN) != 0 ||
             !memmem(p, l, HKEY, sizeof(HKEY) - 1)) {
+
+            /* 사용자 정규식: 한 줄 규칙 */
+            {
+                size_t di;
+                for (di = 0; di < ndrop; di++)
+                    if (pat_match(&drops[di], p, l)) break;
+                if (di < ndrop) { drops[di].hits++; nuser++; continue; }
+            }
+            /* 사용자 정규식: 두 줄 페어 규칙 */
+            {
+                size_t pi;
+                int consumed = 0;
+                for (pi = 0; pi < npair && !consumed; pi++) {
+                    if (!pat_match(&pairA[pi], p, l)) continue;
+                    unsigned char *q; size_t ql;
+                    if (rd_line(&r, &q, &ql)) {
+                        if (pat_match(&pairB[pi], q, ql)) {
+                            nbytes += ql; nline++;   /* 소비했으므로 센다 */
+                            pairA[pi].hits++; pairB[pi].hits++;
+                            nuser += 2;
+                            consumed = 1;
+                        } else {
+                            rd_unget(&r, ql);        /* 짝이 아니다 -> 되돌린다 */
+                        }
+                    }
+                    break;   /* A 가 맞았으면 이 줄에 대한 판정은 끝 */
+                }
+                if (consumed) continue;
+            }
 
             /* deposit 줄과 PNOOBJ 줄을 버린다.
              * 둘 다 'x' 로 시작하므로 바이트 하나로 먼저 걸러낸다. */
@@ -768,6 +897,15 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "  deposit   : %llu 줄 + PNOOBJ %llu 줄 = %llu 줄 삭제\n",
                 ndep, nerr, ndep + nerr);
+    if (nuser) {
+        fprintf(stderr, "  규칙 삭제 : %llu 줄\n", nuser);
+        for (size_t k = 0; k < ndrop; k++)
+            fprintf(stderr, "    --drop %-28s %llu 줄\n",
+                    drops[k].src, drops[k].hits);
+        for (size_t k = 0; k < npair; k++)
+            fprintf(stderr, "    --drop-pair %-23s %llu 짝\n",
+                    pairA[k].src, pairA[k].hits);
+    }
     if (unparsed)
         fprintf(stderr,
                 "  주의: 형식이 다른 violation 후보 %llu 건은 원본에 남겼습니다.\n",

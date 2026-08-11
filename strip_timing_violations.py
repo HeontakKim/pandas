@@ -7,8 +7,9 @@ SDF annotation 시뮬레이션 로그(sim.log)를 정리하고, 지워진 정보
 형태로 남긴다. 한 번의 streaming pass 로 아래를 모두 처리한다.
 
   - Timing violation 블록(5줄) 제거 -> scope 별로 집계해서 DB 에 보관
-  - 반복되는 xcelium deposit 줄과 PNOOBJ 에러 줄 제거 -> 남길 정보가 없어 그냥 버림
-    (--keep-deposit 로 끄고, --deposit-pairs-only 로 짝일 때만 지운다)
+  - (--prune-deposit 을 줬을 때만) 반복되는 xcelium deposit 줄과 PNOOBJ 에러 줄
+    제거 -> 남길 정보가 없어 그냥 버림. strip 의 기본은 violation 만 지우는 것이고,
+    deposit 잡음만 따로 지우려면 prune 서브커맨드를 쓴다.
 
 산출물:
   sim.clean.log       정리된 로그
@@ -32,6 +33,15 @@ SDF annotation 시뮬레이션 로그(sim.log)를 정리하고, 지워진 정보
   # deposit 잡음만 지우기 (timing violation 은 건드리지 않음)
   python3 strip_timing_violations.py prune sim.log --in-place
   python3 strip_timing_violations.py prune *.log --in-place   # 여러 개, 병렬
+
+  # 사용자 정규식으로 임의의 잡음 지우기 (strip / prune 둘 다 가능)
+  ... --drop '^UVM_INFO'                     # 걸리는 줄 전부
+  ... --drop-pair '^ERROR:' '^DETAIL:'       # 두 줄이 연달아 올 때만
+
+정규식은 POSIX 확장 정규식(ERE)으로 쓴다. C 엔진이 ERE 를 쓰기 때문이며,
+파이썬 전용 문법(\\d, lookahead 등)을 쓰면 경고가 나온다.
+'^' 뒤가 순수 리터럴인 패턴('^UVM_INFO')은 memcmp 로만 판정해서 사실상
+공짜지만, '.*' 등이 섞이면 줄마다 정규식 엔진이 돌아 10배 가까이 느려진다.
 
 메모리 사용량은 입력 파일 크기와 무관하며(스트리밍 + 주기적 flush),
 10GB 이상의 로그도 상수 메모리로 처리한다.
@@ -93,6 +103,48 @@ TIME_UNIT_FS = {
 FLUSH_EVERY = 500_000
 
 IO_BUF = 1 << 22  # 4MiB
+
+
+# 파이썬 re 에만 있고 POSIX ERE(C 판)에는 없는 문법. 이걸 쓰면 두 엔진의
+# 결과가 갈리므로 경고한다.
+RE_PY_ONLY = re.compile(r"\\[dwsDWSbBAZ]|\(\?")
+
+
+def compile_rules(args):
+    """
+    --drop / --drop-pair 를 컴파일한다.
+
+    C 판은 POSIX 확장 정규식(ERE)을 쓰므로, 두 엔진에서 같은 결과를 얻으려면
+    ERE 범위 안에서 써야 한다. 파이썬 전용 문법이 보이면 경고만 하고 진행한다
+    (파이썬 엔진만 쓸 수도 있으므로 막지는 않는다).
+    """
+    drops, pairs = [], []
+    for pat in getattr(args, "drop", None) or []:
+        try:
+            drops.append(re.compile(pat.encode()))
+        except re.error as e:
+            sys.exit("error: --drop 정규식이 잘못되었습니다: %s (%s)" % (pat, e))
+    for a, b in getattr(args, "drop_pair", None) or []:
+        try:
+            pairs.append((re.compile(a.encode()), re.compile(b.encode())))
+        except re.error as e:
+            sys.exit("error: --drop-pair 정규식이 잘못되었습니다: %s / %s (%s)"
+                     % (a, b, e))
+
+    for pat in list(getattr(args, "drop", None) or []) + \
+            [x for ab in (getattr(args, "drop_pair", None) or []) for x in ab]:
+        if RE_PY_ONLY.search(pat):
+            sys.stderr.write(
+                "[경고] '%s' 는 파이썬 전용 정규식 문법을 씁니다.\n"
+                "       C 엔진(POSIX ERE)에서는 다르게 동작하거나 실패합니다.\n"
+                "       예: \\d -> [0-9], \\s -> [[:space:]], \\w -> [[:alnum:]_]\n"
+                % pat)
+    return drops, pairs
+
+
+def _probe(line):
+    """정규식 판정용으로 줄 끝 개행을 떼어낸다 (C 판과 동일하게)."""
+    return line.rstrip(b"\r\n")
 
 
 def _blank(line):
@@ -223,6 +275,7 @@ class ViolationStore:
         self.unparsed = 0
         self.pruned_dep = 0
         self.pruned_err = 0
+        self.user_dropped = 0
 
         if keep_detail:
             if os.path.exists(detail_path):
@@ -323,7 +376,11 @@ def _strip_python_file(src, dst, store, args):
     # 임계값에 도달했을 때만 report() 를 부른다. 비활성화 시 inf 를 넣어두면
     # 루프 안에 별도의 'if enabled' 분기를 두지 않아도 된다.
     INF = float("inf")
-    prune_dep = not getattr(args, "keep_deposit", False)
+    prune_dep = getattr(args, "prune_deposit", False)
+    drops, pairs = compile_rules(args)
+    has_rules = bool(drops or pairs)
+    rule_hits = [0] * len(drops)
+    pair_hits = [0] * len(pairs)
     pairs_only = getattr(args, "deposit_pairs_only", False)
     every_line = INF if args.no_progress else args.progress_lines
     every_viol = INF if args.no_progress else args.progress_violations
@@ -354,6 +411,40 @@ def _strip_python_file(src, dst, store, args):
             # 전체 줄의 99% 이상은 violation 이 아니다. bytes slice 비교는
             # C 레벨이라 여기서 대부분의 줄이 즉시 통과한다.
             if line[:8] != HEADER_PREFIX or HEADER_KEY not in line:
+
+                # 사용자 정규식 규칙. 규칙이 없으면 비용이 0 이다.
+                if has_rules:
+                    probe = _probe(line)
+                    matched = False
+                    for i, rx in enumerate(drops):
+                        if rx.search(probe):
+                            rule_hits[i] += 1
+                            store.user_dropped += 1
+                            matched = True
+                            break
+                    if matched:
+                        line = nxt()
+                        continue
+
+                    for j, (ra, rb) in enumerate(pairs):
+                        if not ra.search(probe):
+                            continue
+                        nl2 = nxt()
+                        if nl2 and rb.search(_probe(nl2)):
+                            nbytes += len(nl2)
+                            nline += 1
+                            pair_hits[j] += 1
+                            store.user_dropped += 2
+                            line = nxt()
+                        else:
+                            # 짝이 아니다 -> 첫 줄은 살리고 다음 줄을 새로 판정
+                            write(line)
+                            kept += 1
+                            line = nl2 if nl2 else nxt()
+                        matched = True
+                        break        # A 가 맞았으면 이 줄 판정은 끝
+                    if matched:
+                        continue
 
                 # deposit 줄 / PNOOBJ 줄 제거. 둘 다 'x' 로 시작한다.
                 if prune_dep and line[:1] == b"x":
@@ -528,8 +619,12 @@ def _strip_with_c(args, exe):
         cmdbase.append("--no-progress")
     if args.keep_blank:
         cmdbase.append("--keep-blank")
-    if args.keep_deposit:
-        cmdbase.append("--keep-deposit")
+    if args.prune_deposit:
+        cmdbase.append("--prune-deposit")
+    for pat in args.drop or []:
+        cmdbase += ["--drop", pat]
+    for a, b in args.drop_pair or []:
+        cmdbase += ["--drop-pair", a, b]
     if args.deposit_pairs_only:
         cmdbase.append("--deposit-pairs-only")
     cmdbase += ["--progress-lines", str(args.progress_lines),
@@ -607,6 +702,10 @@ def strip(args):
       c      : C 강제 (없으면 오류)
       python : 파이썬 강제 (gzip 상세 레코드까지 생성)
     """
+    # 어느 엔진을 쓰든 정규식은 여기서 먼저 검증한다. C 로 넘긴 뒤에
+    # regcomp 가 실패하면 "C 엔진 실패" 같은 불친절한 메시지만 남는다.
+    compile_rules(args)
+
     exe = None
     if args.engine in ("auto", "c"):
         exe = find_or_build_c(quiet=args.no_progress)
@@ -660,6 +759,9 @@ def strip(args):
             % (format(store.pruned_dep, ","), format(store.pruned_err, ","),
                format(store.pruned_dep + store.pruned_err, ","))
         )
+    if store.user_dropped:
+        sys.stderr.write("  규칙 삭제 : %s 줄\n"
+                         % format(store.user_dropped, ","))
     if store.unparsed:
         sys.stderr.write(
             "  주의: 형식이 다른 violation 후보 %d 건은 원본에 그대로 남겼습니다.\n"
@@ -685,10 +787,13 @@ def strip(args):
 # 달라져도 조용히 매칭에 실패해서 아무것도 지워지지 않기 때문이다.
 # (C 판 is_deposit_cmd() 와 같은 규칙이다. 두 엔진이 어긋나면 안 된다.)
 #
-# 기본값은 deposit 줄과 PNOOBJ 줄을 서로 독립적으로 지우는 것이다. deposit 이
-# 성공해서 에러 줄이 안 붙은 경우까지 전부 지운다. 짝을 맞출 필요가 없으니
-# 앞뒤를 살펴볼 일도 없어서 더 단순하고 빠르다.
+# deposit 줄과 PNOOBJ 줄은 서로 독립적으로 지운다. deposit 이 성공해서 에러
+# 줄이 안 붙은 경우까지 전부 지운다. 짝을 맞출 필요가 없으니 앞뒤를 살펴볼
+# 일도 없어서 더 단순하고 빠르다.
 # --deposit-pairs-only 를 주면 'deposit + 바로 뒤 PNOOBJ' 짝일 때만 지운다.
+#
+# prune 서브커맨드에서는 이게 존재 이유라 항상 켜져 있고, strip 에서는
+# --prune-deposit 을 명시해야 켜진다 (strip 의 기본은 violation 만 지우는 것).
 # ---------------------------------------------------------------------------
 PRUNE_P1_PREFIX = b"xcelium>"
 PRUNE_P2_PREFIX = b"xmsim:"
@@ -730,6 +835,12 @@ def _prune_with_c(args, exe):
     base = [exe, "--prune-only", "--warn-bytes", "0"]
     if args.deposit_pairs_only:
         base.append("--deposit-pairs-only")
+    if args.keep_deposit:
+        base.append("--keep-deposit")   # 내장 규칙 끄고 --drop 만 쓰는 경우
+    for pat in args.drop or []:
+        base += ["--drop", pat]
+    for a, b in args.drop_pair or []:
+        base += ["--drop-pair", a, b]
     if args.no_progress:
         base.append("--no-progress")
     else:
@@ -814,6 +925,7 @@ def _prune_with_c(args, exe):
 
 def prune(args):
     """deposit/PNOOBJ 짝을 지운다. 1패스 스트리밍이라 파일 크기와 무관하다."""
+    compile_rules(args)          # 엔진과 무관하게 먼저 검증
     exe = None
     if args.engine in ("auto", "c"):
         exe = find_or_build_c(quiet=args.no_progress)
@@ -856,8 +968,13 @@ def prune(args):
 
 def _prune_python_file(src, dst, args):
     """파일 하나를 파이썬으로 처리한다. (입력크기, 출력크기, dep, err)."""
-    n_dep = n_err = nbytes = nline = 0
+    n_dep = n_err = n_user = nbytes = nline = 0
     pairs_only = args.deposit_pairs_only
+    prune_dep = not args.keep_deposit
+    drops, pairs = compile_rules(args)
+    has_rules = bool(drops or pairs)
+    rule_hits = [0] * len(drops)
+    pair_hits = [0] * len(pairs)
     total = os.path.getsize(src)
     t0 = time.time()
     eol = "\r" if sys.stderr.isatty() else "\n"
@@ -869,7 +986,8 @@ def _prune_python_file(src, dst, args):
             "[prune] %-16s %5.1f%% %13s lines %9s 삭제 %9s %6.1f MB/s   %s"
             % (os.path.basename(src)[:16],
                nbytes * 100.0 / total if total else 0.0,
-               format(nline, ","), format(n_dep + n_err, ","), _human(nbytes),
+               format(nline, ","), format(n_dep + n_err + n_user, ","),
+               _human(nbytes),
                (nbytes / el if el else 0) / 1e6, "\n" if final else eol))
         sys.stderr.flush()
 
@@ -888,8 +1006,40 @@ def _prune_python_file(src, dst, args):
                 mark = nline + args.progress_lines
                 report()
 
+            # 사용자 정규식 규칙. 규칙이 없으면 비용이 0 이다.
+            if has_rules:
+                probe = _probe(line)
+                matched = False
+                for i, rx in enumerate(drops):
+                    if rx.search(probe):
+                        rule_hits[i] += 1
+                        n_user += 1
+                        matched = True
+                        break
+                if matched:
+                    line = nxt()
+                    continue
+                for j, (ra, rb) in enumerate(pairs):
+                    if not ra.search(probe):
+                        continue
+                    nl2 = nxt()
+                    if nl2 and rb.search(_probe(nl2)):
+                        nbytes += len(nl2)
+                        nline += 1
+                        pair_hits[j] += 1
+                        n_user += 2
+                        line = nxt()
+                    else:
+                        if write is not None:
+                            write(line)
+                        line = nl2 if nl2 else nxt()
+                    matched = True
+                    break
+                if matched:
+                    continue
+
             # fast path: 대부분의 줄은 1~8바이트 비교로 통과한다
-            if line[:1] != b"x":
+            if not prune_dep or line[:1] != b"x":
                 if write is not None:
                     write(line)
                 line = nxt()
@@ -958,10 +1108,11 @@ def _prune_python_file(src, dst, args):
         "\n[prune 완료] %.1fs\n"
         "  입력      : %-28s %12s\n"
         "  결과      : %-28s %12s\n"
-        "  제거      : deposit %s 줄 + PNOOBJ %s 줄 = %s 줄  (%s 절감)\n"
+        "  제거      : deposit %s 줄 + PNOOBJ %s 줄 + 규칙 %s 줄 = %s 줄"
+        "  (%s 절감)\n"
         % (time.time() - t0, src, _human(nbytes), final_path, _human(out_size),
-           format(n_dep, ","), format(n_err, ","),
-           format(n_dep + n_err, ","), _human(nbytes - out_size))
+           format(n_dep, ","), format(n_err, ","), format(n_user, ","),
+           format(n_dep + n_err + n_user, ","), _human(nbytes - out_size))
     )
     return nbytes, out_size, n_dep, n_err
 
@@ -1098,11 +1249,18 @@ def main():
                    help="gzip 압축 레벨 1(빠름)~9(작음), 기본 6")
     s.add_argument("--keep-blank", action="store_true",
                    help="violation 블록 뒤의 빈 줄을 지우지 않음")
-    s.add_argument("--keep-deposit", action="store_true",
-                   help="xcelium deposit / PNOOBJ 줄을 지우지 않음")
+    s.add_argument("--drop", action="append", metavar="RE",
+                    help="이 정규식에 걸리는 줄을 삭제 (여러 번 지정 가능)")
+    s.add_argument("--drop-pair", action="append", nargs=2,
+                    metavar=("RE1", "RE2"),
+                    help="RE1 줄 바로 뒤에 RE2 줄이 올 때만 두 줄 삭제 "
+                         "(여러 번 지정 가능)")
+    s.add_argument("--prune-deposit", action="store_true",
+                   help="xcelium deposit / PNOOBJ 줄까지 함께 삭제 "
+                        "(기본: timing violation 만 삭제)")
     s.add_argument("--deposit-pairs-only", action="store_true",
-                   help="deposit + 바로 뒤 PNOOBJ 짝일 때만 지움 "
-                        "(성공한 deposit 은 보존)")
+                   help="--prune-deposit 과 함께: deposit + 바로 뒤 PNOOBJ "
+                        "짝일 때만 지움 (성공한 deposit 은 보존)")
     s.add_argument("--progress-lines", type=int, default=1_000_000,
                    metavar="N", help="N 줄마다 진행률 출력 (기본: 1000000)")
     s.add_argument("--progress-violations", type=int, default=1000,
@@ -1124,6 +1282,14 @@ def main():
                     help="결과 파일 (기본: <입력>.pruned.log, 입력 1개일 때만)")
     pr.add_argument("--in-place", action="store_true",
                     help="임시 파일에 쓴 뒤 원본을 교체 (원자적)")
+    pr.add_argument("--drop", action="append", metavar="RE",
+                    help="이 정규식에 걸리는 줄을 삭제 (여러 번 지정 가능)")
+    pr.add_argument("--drop-pair", action="append", nargs=2,
+                    metavar=("RE1", "RE2"),
+                    help="RE1 줄 바로 뒤에 RE2 줄이 올 때만 두 줄 삭제 "
+                         "(여러 번 지정 가능)")
+    pr.add_argument("--keep-deposit", action="store_true",
+                    help="내장 deposit/PNOOBJ 규칙을 끔 (--drop 만 쓸 때)")
     pr.add_argument("--deposit-pairs-only", action="store_true",
                     help="deposit + 바로 뒤 PNOOBJ 짝일 때만 지움 "
                          "(성공한 deposit 은 보존)")
