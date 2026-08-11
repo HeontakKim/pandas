@@ -9,6 +9,7 @@
  *   - xcelium deposit 줄과 PNOOBJ 에러 줄 -> --prune-deposit 을 줬을 때만 지운다
  *     (--prune-only 모드에서는 기본으로 켜짐, --deposit-pairs-only 로 짝일 때만)
  *   - 사용자 정규식(POSIX ERE) 규칙
+ *       --drop-prefix STR    이 글자로 시작하는 줄을 지운다 (정규식 아님, 가장 빠름)
  *       --drop RE            걸리는 줄을 지운다 (여러 번 지정 가능)
  *       --drop-pair RE1 RE2  RE1 줄 바로 뒤에 RE2 줄이 올 때만 두 줄을 지운다
  *
@@ -389,12 +390,35 @@ static inline int is_blank(const unsigned char *p, size_t n)
 /* ------------------------------------------------------------------ */
 typedef struct {
     regex_t            re;
-    char               lit[32];   /* '^' 뒤의 리터럴 접두사 */
+    int                has_re;   /* regcomp 을 했는지 (--drop-prefix 는 안 한다) */
+    char              *lit;      /* '^' 뒤의 리터럴 접두사 */
     size_t             litlen;
-    int                litonly;   /* 패턴 전체가 ^리터럴 이면 1 */
+    int                litonly;  /* 리터럴 일치가 곧 전체 일치면 1 */
     unsigned long long hits;
     const char        *src;
 } Pat;
+
+/*
+ * --drop-prefix: 정규식을 아예 쓰지 않고 "이 글자로 시작하는 줄"만 지운다.
+ *
+ * --drop 으로도 같은 일을 할 수 있지만, 로그에서 복사한 접두사에는 '.'
+ * (파일명/계층)이나 '*' 같은 정규식 메타문자가 거의 항상 들어 있다.
+ * 그러면 리터럴 추출이 거기서 끊겨 조용히 regexec 경로로 떨어진다
+ * (실측: 903 MB/s -> 34 MB/s). 리터럴임을 명시하면 그럴 일이 없다.
+ */
+static void pat_prefix(Pat *pt, const char *src)
+{
+    size_t n = strlen(src);
+    if (n == 0) die("--drop-prefix 에 빈 문자열은 쓸 수 없습니다");
+    pt->lit = malloc(n + 1);
+    if (!pt->lit) die("메모리 부족");
+    memcpy(pt->lit, src, n + 1);
+    pt->litlen = n;
+    pt->litonly = 1;      /* 접두사 일치 = 전체 일치. 정규식 엔진을 안 부른다 */
+    pt->has_re = 0;
+    pt->hits = 0;
+    pt->src = src;
+}
 
 static char  *pat_scratch;        /* NUL 종료가 필요할 때 쓰는 재사용 버퍼 */
 static size_t pat_scratch_cap;
@@ -411,12 +435,14 @@ static void pat_compile(Pat *pt, const char *src)
     pt->src = src;
     pt->litlen = 0;
     pt->litonly = 0;
+    pt->has_re = 1;
+    pt->lit = malloc(strlen(src) + 1);
+    if (!pt->lit) die("메모리 부족");
 
     /* '^' 뒤로 이어지는 평범한 글자만 접두사로 뽑는다 */
     if (src[0] == '^') {
         const char *q = src + 1;
-        while (*q && pt->litlen < sizeof pt->lit - 1 &&
-               !strchr(".[]()*+?{}|\\^$", *q))
+        while (*q && !strchr(".[]()*+?{}|\\^$", *q))
             pt->lit[pt->litlen++] = *q++;
         /* 뒤에 수량자가 붙으면 마지막 글자는 접두사가 아니다: ^abc* */
         if (pt->litlen && *q && strchr("*?{", *q))
@@ -602,6 +628,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--prune-deposit"))     prune_deposit = 1;
         else if (!strcmp(a, "--drop") && i + 1 < argc)
             pat_compile(&drops[ndrop++], argv[++i]);
+        else if (!strcmp(a, "--drop-prefix") && i + 1 < argc)
+            pat_prefix(&drops[ndrop++], argv[++i]);
         else if (!strcmp(a, "--drop-pair") && i + 2 < argc) {
             pat_compile(&pairA[npair], argv[i + 1]);
             pat_compile(&pairB[npair], argv[i + 2]);
