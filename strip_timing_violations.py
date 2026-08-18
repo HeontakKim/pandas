@@ -51,7 +51,18 @@ memcmp 로 판정해서 규칙이 없을 때와 속도가 같고(800MB 기준 �
 공짜지만, '.*' 등이 섞이면 줄마다 정규식 엔진이 돌아 10배 가까이 느려진다.
 
 메모리 사용량은 입력 파일 크기와 무관하며(스트리밍 + 주기적 flush),
-10GB 이상의 로그도 상수 메모리로 처리한다.
+10GB 이상의 로그도 상수 메모리로 처리한다. 단 한 줄이 통째로 램에 올라오므로
+비정상적으로 긴 줄 하나가 그 보장을 깬다. 디스크가 가득 찬 상태로 기록된
+로그에는 개행 없는 NUL 덩어리가 GB 단위로 남는 일이 있는데(write 가 부분
+실패하면 파일 크기만 늘고 블록은 커밋되지 않아 그 구간이 NUL 로 읽힌다),
+실측으로 300MB 짜리 줄 하나에 C 판 RSS 515MB / 파이썬 626MB 를 썼다.
+
+  ... --max-line 1048576        1MB 넘는 줄은 버린다 (RSS 515MB -> 11MB)
+  ... --max-line 1048576 --truncate-long   버리지 않고 앞 1MB 만 남긴다
+
+기본값은 0(무제한)이라 기존 동작 그대로다. 긴 줄이 진짜 로그일 수도 있어
+말없이 지우지 않는다. 대신 16MB 가 넘는 줄을 만나면 한 번 경고한다.
+이미 만들어진 파일에서 NUL 만 걷어내려면 tr -d '\\0' 이 가장 빠르다.
 """
 
 import argparse
@@ -111,6 +122,11 @@ FLUSH_EVERY = 500_000
 
 IO_BUF = 1 << 22  # 4MiB
 
+# --max-line 없이도 비정상적으로 긴 줄을 만나면 한 번은 알려준다.
+# 정상 로그 줄은 수백 바이트다. 이 시점엔 이미 그 줄만큼 램을 쓴 뒤라
+# 늦었지만, 다음 실행 때 무엇을 줘야 하는지는 알 수 있다.
+LONG_LINE_WARN = 4 << 20
+
 
 # 파이썬 re 에만 있고 POSIX ERE(C 판)에는 없는 문법. 이걸 쓰면 두 엔진의
 # 결과가 갈리므로 경고한다.
@@ -167,6 +183,74 @@ def prefix_rules(args):
             sys.exit("error: --drop-prefix 에 빈 문자열은 쓸 수 없습니다")
         out.append(p.encode())
     return tuple(out)
+
+
+def make_line_reader(fin, maxline, trunc):
+    """
+    fin.readline 을 감싸서 maxline 을 넘는 줄을 처리한다.
+
+    왜 필요한가: 정상 로그 줄은 수백 바이트다. 그보다 몇 자리수 긴 줄은
+    로그가 아니라, 디스크가 가득 찬 상태로 기록되다 만 NUL 덩어리이거나
+    개행을 빠뜨린 덤프다. 그런 줄은 readline() 이 통째로 램에 올린다
+    (실측: 300MB 짜리 줄 하나에 RSS 626MB). 10GB 로그를 병렬로 돌리면
+    이런 파일 하나가 잡 전체를 죽인다.
+
+    readline(size) 는 size 바이트까지만 읽으므로 C 판의 maxline 과 같은
+    방식으로 버퍼가 커지는 걸 막는다. 결과가 딱 size 바이트인데 개행으로
+    끝나지 않으면 그 줄은 한계를 넘은 것이다.
+
+    반환: (nxt, over)
+      nxt()  다음 줄. 한계를 넘은 줄은 버리거나(기본) 앞부분만 남긴다.
+      over   [줄 수, 아직 nbytes 에 안 더한 바이트, 버린 총 바이트]
+             maxline 이 0 이면 None (감싸지 않고 원본 readline 을 준다)
+    """
+    if not maxline:
+        return fin.readline, None
+
+    raw = fin.readline
+    over = [0, 0, 0, 0]   # 마지막 칸은 아직 nline 에 안 더한 줄 수
+    SKIP = 1 << 20
+
+    def nxt():
+        while True:
+            line = raw(maxline)
+            if not line:
+                return b""
+            if line.endswith(b"\n") or len(line) < maxline:
+                return line
+
+            # 한계 초과. 나머지를 개행까지 버린다(버퍼를 키우지 않는다).
+            skipped = 0
+            while True:
+                c = raw(SKIP)
+                if not c:
+                    break
+                skipped += len(c)
+                if c.endswith(b"\n"):
+                    break
+            over[0] += 1
+            over[2] += len(line) + skipped
+
+            if trunc:
+                # 호출자는 maxline+1 을 셀 텐데 실제로는 maxline+skipped 를
+                # 소비했다. 그 차이를 넘긴다.
+                over[1] += skipped - 1
+                return line + b"\n"
+            # 버린 줄은 호출자가 아예 못 보므로 전부 여기서 센다
+            over[1] += len(line) + skipped
+            over[3] += 1
+
+    return nxt, over
+
+
+def warn_long_line(n, lineno):
+    sys.stderr.write(
+        "\n  [경고] %s 바이트짜리 줄을 만났습니다 (줄 %s).\n"
+        "         정상 로그 줄이 아닙니다. 디스크가 가득 찬 상태로\n"
+        "         기록된 로그에는 개행 없는 NUL 덩어리가 GB 단위로\n"
+        "         남기도 하며, 그런 줄은 통째로 램에 올라옵니다.\n"
+        "         --max-line 1048576 을 주면 그런 줄을 버립니다.\n"
+        % (format(n, ","), format(lineno, ",")))
 
 
 def _probe(line):
@@ -303,6 +387,8 @@ class ViolationStore:
         self.pruned_dep = 0
         self.pruned_err = 0
         self.user_dropped = 0
+        self.long_lines = 0
+        self.long_bytes = 0
 
         if keep_detail:
             if os.path.exists(detail_path):
@@ -419,13 +505,23 @@ def _strip_python_file(src, dst, store, args):
     fin = open(src, "rb", buffering=IO_BUF)
     fout = open(dst, "wb", buffering=IO_BUF)
     write = fout.write
-    nxt = fin.readline
+    nxt, over = make_line_reader(
+        fin, getattr(args, "max_line", 0), getattr(args, "truncate_long", False))
+    warn_at = LONG_LINE_WARN
 
     try:
         line = nxt()
         while line:
             nbytes += len(line)
             nline += 1
+            # 한계를 넘어 버려진 줄은 호출자가 볼 수 없으므로 여기서
+            # 합쳐준다. 안 그러면 진행률이 뒤처지고, C 판과 줄 수가 어긋난다.
+            if over is not None and over[1]:
+                nbytes += over[1]; nline += over[3]
+                over[1] = over[3] = 0
+            if len(line) >= warn_at:
+                warn_long_line(len(line), nline)
+                warn_at = 1 << 62      # 한 번만 알린다
 
             # 진행률은 줄을 읽은 직후에 확인한다. 아래 분기 안쪽에 두면
             # 버려지는 줄(deposit/PNOOBJ, violation 블록)에서 continue 로
@@ -602,8 +698,17 @@ def _strip_python_file(src, dst, store, args):
         fout.close()
         fin.close()
 
+    # 마지막 줄이 버려졌으면 루프가 한 번 더 돌지 않아 위 flush 를 못 탄다.
+    if over is not None and over[1]:
+        nbytes += over[1]; nline += over[3]
+        over[1] = over[3] = 0
+
     if not args.no_progress:
         report(final=True)   # 마지막 진행률을 확정 출력하고 '\r' 줄을 닫는다
+
+    if over is not None and over[0]:
+        store.long_lines += over[0]
+        store.long_bytes += over[2]
 
     return nbytes, nline, kept
 
@@ -661,6 +766,10 @@ def _strip_with_c(args, exe):
         cmdbase.append("--keep-blank")
     if args.prune_deposit:
         cmdbase.append("--prune-deposit")
+    if args.max_line:
+        cmdbase += ["--max-line", str(args.max_line)]
+        if args.truncate_long:
+            cmdbase.append("--truncate-long")
     for pat in args.drop_prefix or []:
         cmdbase += ["--drop-prefix", pat]
     for pat in args.drop or []:
@@ -747,6 +856,7 @@ def strip(args):
     # 어느 엔진을 쓰든 정규식은 여기서 먼저 검증한다. C 로 넘긴 뒤에
     # regcomp 가 실패하면 "C 엔진 실패" 같은 불친절한 메시지만 남는다.
     compile_rules(args)
+    check_max_line(args)
 
     exe = None
     if args.engine in ("auto", "c"):
@@ -804,6 +914,11 @@ def strip(args):
     if store.user_dropped:
         sys.stderr.write("  규칙 삭제 : %s 줄\n"
                          % format(store.user_dropped, ","))
+    if store.long_lines:
+        sys.stderr.write(
+            "  긴 줄     : %s 줄 %s %s (--max-line %d)\n"
+            % (format(store.long_lines, ","), _human(store.long_bytes),
+               "잘라냄" if args.truncate_long else "삭제", args.max_line))
     if store.unparsed:
         sys.stderr.write(
             "  주의: 형식이 다른 violation 후보 %d 건은 원본에 그대로 남겼습니다.\n"
@@ -856,6 +971,15 @@ def _prune_dst(args, src):
     return dst
 
 
+def check_max_line(args):
+    """--max-line / --truncate-long 조합을 C 판과 같은 규칙으로 검증한다."""
+    if args.max_line and args.max_line < 1024:
+        sys.exit("error: --max-line 은 1024 이상이어야 합니다 (받은 값: %d)"
+                 % args.max_line)
+    if args.truncate_long and not args.max_line:
+        sys.exit("error: --truncate-long 은 --max-line 과 같이 써야 합니다")
+
+
 def check_inputs(paths):
     """입력이 전부 읽을 수 있는 일반 파일인지 먼저 확인한다."""
     for p in paths:
@@ -879,6 +1003,10 @@ def _prune_with_c(args, exe):
         base.append("--deposit-pairs-only")
     if args.keep_deposit:
         base.append("--keep-deposit")   # 내장 규칙 끄고 --drop 만 쓰는 경우
+    if args.max_line:
+        base += ["--max-line", str(args.max_line)]
+        if args.truncate_long:
+            base.append("--truncate-long")
     for pat in args.drop_prefix or []:
         base += ["--drop-prefix", pat]
     for pat in args.drop or []:
@@ -970,6 +1098,7 @@ def _prune_with_c(args, exe):
 def prune(args):
     """deposit/PNOOBJ 짝을 지운다. 1패스 스트리밍이라 파일 크기와 무관하다."""
     compile_rules(args)          # 엔진과 무관하게 먼저 검증
+    check_max_line(args)
     exe = None
     if args.engine in ("auto", "c"):
         exe = find_or_build_c(quiet=args.no_progress)
@@ -1039,13 +1168,20 @@ def _prune_python_file(src, dst, args):
 
     fin = open(src, "rb", buffering=IO_BUF)
     fout = None if args.dry_run else open(dst, "wb", buffering=IO_BUF)
-    nxt = fin.readline
+    nxt, over = make_line_reader(fin, args.max_line, args.truncate_long)
+    warn_at = LONG_LINE_WARN
     write = fout.write if fout is not None else None
     try:
         line = nxt()
         while line:
             nbytes += len(line)
             nline += 1
+            if over is not None and over[1]:
+                nbytes += over[1]; nline += over[3]
+                over[1] = over[3] = 0
+            if len(line) >= warn_at:
+                warn_long_line(len(line), nline)
+                warn_at = 1 << 62      # 한 번만 알린다
 
             # 진행률은 줄을 읽은 직후에 확인한다(버려지는 줄 포함).
             if nline >= mark:
@@ -1144,6 +1280,10 @@ def _prune_python_file(src, dst, args):
         if fout is not None:
             fout.close()
 
+    if over is not None and over[1]:
+        nbytes += over[1]; nline += over[3]
+        over[1] = over[3] = 0
+
     if not args.no_progress:
         report(final=True)
 
@@ -1171,6 +1311,11 @@ def _prune_python_file(src, dst, args):
            format(n_dep, ","), format(n_err, ","), format(n_user, ","),
            format(n_dep + n_err + n_user, ","), _human(nbytes - out_size))
     )
+    if over is not None and over[0]:
+        sys.stderr.write(
+            "  긴 줄     : %s 줄 %s %s (--max-line %d)\n"
+            % (format(over[0], ","), _human(over[2]),
+               "잘라냄" if args.truncate_long else "삭제", args.max_line))
     return nbytes, out_size, n_dep, n_err
 
 
@@ -1306,6 +1451,11 @@ def main():
                    help="gzip 압축 레벨 1(빠름)~9(작음), 기본 6")
     s.add_argument("--keep-blank", action="store_true",
                    help="violation 블록 뒤의 빈 줄을 지우지 않음")
+    s.add_argument("--max-line", type=int, default=0, metavar="N",
+                   help="N 바이트가 넘는 줄을 삭제 (0=무제한). 디스크가 가득 찬 "
+                        "상태로 기록된 로그의 NUL 덩어리 대응. 권장: 1048576")
+    s.add_argument("--truncate-long", action="store_true",
+                   help="--max-line 초과 줄을 버리지 않고 앞부분만 남김")
     s.add_argument("--drop-prefix", action="append", metavar="STR",
                    help="이 글자로 시작하는 줄을 삭제 (정규식 아님, 가장 빠름). "
                         "여러 번 지정 가능")
@@ -1356,6 +1506,11 @@ def main():
     pr.add_argument("--deposit-pairs-only", action="store_true",
                     help="deposit + 바로 뒤 PNOOBJ 짝일 때만 지움 "
                          "(성공한 deposit 은 보존)")
+    pr.add_argument("--max-line", type=int, default=0, metavar="N",
+                    help="N 바이트가 넘는 줄을 삭제 (0=무제한). 디스크가 가득 찬 "
+                         "상태로 기록된 로그의 NUL 덩어리 대응. 권장: 1048576")
+    pr.add_argument("--truncate-long", action="store_true",
+                    help="--max-line 초과 줄을 버리지 않고 앞부분만 남김")
     pr.add_argument("--dry-run", action="store_true",
                     help="개수만 세고 파일은 만들지 않음")
     pr.add_argument("--progress-lines", type=int, default=1_000_000, metavar="N",

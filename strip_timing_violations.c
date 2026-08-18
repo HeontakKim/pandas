@@ -8,6 +8,7 @@
  *   - Timing violation 블록 (5줄) -> scope 별로 집계해 TSV 로 내보낸다
  *   - xcelium deposit 줄과 PNOOBJ 에러 줄 -> --prune-deposit 을 줬을 때만 지운다
  *     (--prune-only 모드에서는 기본으로 켜짐, --deposit-pairs-only 로 짝일 때만)
+ *   - --max-line N 을 주면 N 바이트가 넘는 줄을 지운다 (--truncate-long 이면 자른다)
  *   - 사용자 정규식(POSIX ERE) 규칙
  *       --drop-prefix STR    이 글자로 시작하는 줄을 지운다 (정규식 아님, 가장 빠름)
  *       --drop RE            걸리는 줄을 지운다 (여러 번 지정 가능)
@@ -86,9 +87,11 @@ typedef struct {
     size_t         len;   /* 유효 데이터 끝      */
     size_t         pos;   /* 다음에 읽을 위치    */
     int            eof;
+    size_t         maxline; /* 한 줄 최대 바이트. 0 이면 무제한 */
+    int            over;    /* 방금 돌려준 줄이 maxline 에서 잘렸으면 1 */
 } Reader;
 
-static void rd_init(Reader *r, int fd)
+static void rd_init(Reader *r, int fd, size_t maxline)
 {
     r->fd = fd;
     r->cap = RD_BUF;
@@ -96,15 +99,24 @@ static void rd_init(Reader *r, int fd)
     if (!r->buf) die("메모리 부족");
     r->len = r->pos = 0;
     r->eof = 0;
+    r->maxline = maxline;
+    r->over = 0;
 }
 
 /*
  * 한 줄을 돌려준다(개행 포함). 줄이 없으면 0.
  * 버퍼 경계에 걸친 줄은 앞으로 당긴 뒤 다시 채운다. 한 줄이 버퍼보다 길면
- * 버퍼를 2배로 늘린다(정상 로그에선 일어나지 않지만 방어적으로).
+ * 버퍼를 2배로 늘린다.
+ *
+ * maxline 이 설정돼 있으면 그 길이까지만 모으고 r->over 를 세워 돌려준다.
+ * 버퍼를 무한정 키우지 않기 위한 것이다 — 디스크가 가득 차서 쓰기가 실패한
+ * 로그에는 개행 없는 NUL 덩어리가 GB 단위로 남는 일이 있는데, 그러면
+ * 이 함수가 그 줄 전체를 램에 올린다(실측: 300MB 줄에 RSS 515MB).
+ * over 로 돌아온 줄의 나머지는 호출자가 rd_skip_to_eol() 로 버려야 한다.
  */
 static int rd_line(Reader *r, unsigned char **out, size_t *outlen)
 {
+    r->over = 0;
     for (;;) {
         if (r->pos < r->len) {
             unsigned char *base = r->buf + r->pos;
@@ -112,9 +124,26 @@ static int rd_line(Reader *r, unsigned char **out, size_t *outlen)
             unsigned char *nl = memchr(base, '\n', avail);
             if (nl) {
                 size_t n = (size_t)(nl - base) + 1;
+                /* 개행이 버퍼 안에 있어도 거리가 한계를 넘으면 잘린 줄이다.
+                 * 이 검사를 빼면 '버퍼보다 긴 줄'만 걸려서, maxline 보다는
+                 * 길고 버퍼보다는 짧은 줄이 그대로 통과한다. */
+                if (r->maxline && n > r->maxline) {
+                    *out = base;
+                    *outlen = r->maxline;
+                    r->pos += r->maxline;
+                    r->over = 1;
+                    return 1;
+                }
                 *out = base;
                 *outlen = n;
                 r->pos += n;
+                return 1;
+            }
+            if (r->maxline && avail >= r->maxline) {
+                *out = base;
+                *outlen = r->maxline;
+                r->pos += r->maxline;
+                r->over = 1;
                 return 1;
             }
             if (r->eof) {           /* 마지막 줄에 개행이 없는 경우 */
@@ -152,6 +181,42 @@ static int rd_line(Reader *r, unsigned char **out, size_t *outlen)
 
 /* 방금 읽은 줄을 되돌린다. 그 사이에 다른 read 가 없어야 한다. */
 static inline void rd_unget(Reader *r, size_t n) { r->pos -= n; }
+
+/*
+ * 현재 줄의 나머지를 개행까지 버린다. 버린 바이트 수를 돌려준다.
+ * rd_line() 이 over 로 돌아왔을 때만 부른다. 버퍼를 키우지 않으므로
+ * 줄이 아무리 길어도 메모리가 늘지 않는다.
+ *
+ * 주의: 이 함수는 버퍼를 다시 채우므로 직전 rd_line() 이 돌려준 포인터가
+ * 무효가 된다. 잘린 줄을 출력할 거라면 이걸 부르기 전에 써야 한다.
+ */
+static unsigned long long rd_skip_to_eol(Reader *r)
+{
+    unsigned long long n = 0;
+    for (;;) {
+        if (r->pos < r->len) {
+            unsigned char *base = r->buf + r->pos;
+            size_t avail = r->len - r->pos;
+            unsigned char *nl = memchr(base, '\n', avail);
+            if (nl) {
+                size_t k = (size_t)(nl - base) + 1;
+                r->pos += k;
+                return n + k;
+            }
+            n += avail;
+            r->pos = r->len;
+        }
+        if (r->eof) return n;
+        r->len = r->pos = 0;            /* 전부 버렸으니 처음부터 채운다 */
+        ssize_t got = read(r->fd, r->buf, r->cap);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            die("읽기 실패: %s", strerror(errno));
+        }
+        if (got == 0) r->eof = 1;
+        else r->len = (size_t)got;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* 버퍼 라이터                                                          */
@@ -603,6 +668,8 @@ int main(int argc, char **argv)
     unsigned long long warn_bytes = DEFAULT_WARN_BYTES;
     int no_progress = 0, keep_blank = 0, prune_only = 0;
     int prune_deposit = -1;   /* -1 = 지정 안 됨. 아래에서 모드별 기본값을 정한다 */
+    unsigned long long max_line = 0;   /* 0 = 무제한 (기존 동작) */
+    int trunc_long = 0;                /* 긴 줄을 버리지 않고 앞부분만 남긴다 */
 
     /* 사용자 정규식 규칙 (개수가 적으므로 argc 만큼 넉넉히 잡는다) */
     Pat *drops = calloc((size_t)argc + 1, sizeof(Pat));
@@ -622,6 +689,9 @@ int main(int argc, char **argv)
             prog_viol = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--warn-bytes") && i + 1 < argc)
             warn_bytes = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--max-line") && i + 1 < argc)
+            max_line = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--truncate-long"))     trunc_long = 1;
         else if (!strcmp(a, "--no-progress"))       no_progress = 1;
         else if (!strcmp(a, "--keep-blank"))        keep_blank = 1;
         else if (!strcmp(a, "--keep-deposit"))      prune_deposit = 0;
@@ -667,13 +737,24 @@ int main(int argc, char **argv)
     int fout = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fout < 0) die("출력을 열 수 없습니다: %s", out_path);
 
-    Reader r; rd_init(&r, fin);
+    if (max_line && max_line < 1024)
+        die("--max-line 은 1024 이상이어야 합니다 (받은 값: %llu)", max_line);
+    if (trunc_long && !max_line)
+        die("--truncate-long 은 --max-line 과 같이 써야 합니다");
+
+    Reader r; rd_init(&r, fin, (size_t)max_line);
     Writer w; wr_init(&w, fout);
     Agg agg;  agg_init(&agg);
 
     unsigned long long nline = 0, nviol = 0, kept = 0, unparsed = 0;
     unsigned long long ndep = 0, nerr = 0, nuser = 0;
     unsigned long long nbytes = 0;
+    unsigned long long nover = 0, nover_bytes = 0;
+    int warned_long = 0;
+    /* --max-line 없이도 비정상적으로 긴 줄을 만나면 한 번은 알려준다.
+     * 이 시점엔 이미 그 줄만큼 램을 쓴 뒤라 늦었지만, 다음 실행 때
+     * 무엇을 줘야 하는지는 알 수 있다. */
+#define LONG_LINE_WARN (4ULL << 20)   /* 정상 로그 줄은 수백 바이트다 */
     unsigned long long line_mark = prog_lines, viol_mark = prog_viol;
     double t0 = now_sec();
     int tty = isatty(STDERR_FILENO);
@@ -710,6 +791,35 @@ int main(int argc, char **argv)
         if (!no_progress && nline >= line_mark) {
             line_mark = nline + prog_lines;
             REPORT(0);
+        }
+
+        /* ---- maxline 을 넘긴 줄 ----
+         * 정상 로그 줄은 수백 바이트다. 이만큼 긴 줄은 로그가 아니라
+         * 쓰기가 실패해서 남은 NUL 덩어리이거나 개행을 빠뜨린 덤프다.
+         * 나머지를 버려서 버퍼가 커지지 않게 한다. */
+        if (r.over) {
+            if (trunc_long) {
+                /* rd_skip_to_eol() 이 버퍼를 다시 채우면 p 가 무효가 되므로
+                 * 반드시 먼저 쓴다. */
+                wr_put(&w, p, l);
+                wr_put(&w, (const unsigned char *)"\n", 1);
+                kept++;
+            }
+            unsigned long long skipped = rd_skip_to_eol(&r);
+            nbytes += skipped;
+            nover++;
+            nover_bytes += l + skipped;
+            continue;
+        }
+        if (!warned_long && l >= LONG_LINE_WARN) {
+            warned_long = 1;
+            fprintf(stderr,
+                "\n  [경고] %llu 바이트짜리 줄을 만났습니다 (줄 %llu).\n"
+                "         정상 로그 줄이 아닙니다. 디스크가 가득 찬 상태로\n"
+                "         기록된 로그에는 개행 없는 NUL 덩어리가 GB 단위로\n"
+                "         남기도 하며, 그런 줄은 통째로 램에 올라옵니다.\n"
+                "         --max-line 1048576 을 주면 그런 줄을 버립니다.\n",
+                (unsigned long long)l, nline);
         }
 
         /* ---- fast path: 대부분의 줄은 여기서 끝난다 ----
@@ -921,6 +1031,12 @@ int main(int argc, char **argv)
                 "  violation : %llu 건  (남긴 줄 %llu)\n",
                 dt, dt > 0 ? nbytes / 1e6 / dt : 0,
                 in_path, hb, out_path, ob, agg_path, agg.uniq, nviol, kept);
+    if (nover) {
+        char lb[32];
+        human((double)nover_bytes, lb, sizeof lb);
+        fprintf(stderr, "  긴 줄     : %llu 줄 %s %s (--max-line %llu)\n",
+                nover, lb, trunc_long ? "잘라냄" : "삭제", max_line);
+    }
     if (ndep || nerr)
         fprintf(stderr,
                 "  deposit   : %llu 줄 + PNOOBJ %llu 줄 = %llu 줄 삭제\n",
